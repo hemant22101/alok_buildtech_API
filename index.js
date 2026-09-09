@@ -7,11 +7,14 @@ app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 10000;
 const WIALON_URL = 'https://hst-api.wialon.com/wialon/ajax.html';
+
+// Alok Buildtech Configuration
 const TOKEN = process.env.WIALON_TOKEN;
-const CLIENT_API_KEY = process.env.CLIENT_API_KEY || 'alok_secure_key_2026';
+const CLIENT_API_KEY = process.env.CLIENT_API_KEY || 'alok_buidtech_abpl@9000';
 
 let sessionId = null;
 
+// Reusable Wialon session recovery function
 async function getSession() {
   if (sessionId) return sessionId;
 
@@ -23,43 +26,28 @@ async function getSession() {
   });
 
   if (response.data.error) {
-    throw new Error(`Wialon login failed. Error code: ${response.data.error}`);
+    throw new Error(`Wialon login failed with error code: ${response.data.error}`);
   }
 
   sessionId = response.data.eid;
   return sessionId;
 }
 
-function parseMetric(val) {
-  if (!val) return 0;
-  const raw = typeof val === 'object' ? val.t : val;
-  const cleaned = String(raw).replace(/[^\d.-]/g, '');
-  return parseFloat(cleaned) || 0;
-}
-
-function parseDurationToHours(timeStr) {
-  const raw = typeof timeStr === 'object' ? timeStr.t : timeStr;
-  if (!raw || !String(raw).includes(':')) return 0;
-  const parts = String(raw).split(':').map(Number);
-  const hours = parts[0] || 0;
-  const minutes = parts[1] || 0;
-  const seconds = parts[2] || 0;
-  return +(hours + minutes / 60 + seconds / 3600).toFixed(2);
-}
-
-// Service Health Check
+// Health Check
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    service: 'Alok Buildtech Operational Analytics API'
+    service: 'Alok Buildtech Fleet Analytics API'
   });
 });
 
-// 1. Live Vehicle Fleet Status
+// -------------------------------------------------------------
+// 1. Real-Time Vehicle Tracking (Live Speed, GPS, Heading)
+// -------------------------------------------------------------
 app.get('/api/vehicles', async (req, res) => {
   const providedKey = req.headers['x-api-key'] || req.query.apiKey;
   if (providedKey !== CLIENT_API_KEY) {
-    return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+    return res.status(401).json({ status: 'error', message: 'Unauthorized: Invalid API key' });
   }
 
   const page = parseInt(req.query.page) || 1;
@@ -72,7 +60,12 @@ app.get('/api/vehicles', async (req, res) => {
     let eid = await getSession();
 
     const searchParams = {
-      spec: { itemsType: 'avl_unit', propName: 'sys_name', propValueMask: searchMask, sortType: 'sys_name' },
+      spec: {
+        itemsType: 'avl_unit',
+        propName: 'sys_name',
+        propValueMask: searchMask,
+        sortType: 'sys_name'
+      },
       force: 1,
       flags: 1025,
       from,
@@ -112,36 +105,50 @@ app.get('/api/vehicles', async (req, res) => {
   }
 });
 
-// 2. Operational Fuel & Mileage Summary Report
+// -------------------------------------------------------------
+// 2. Multi-Section Operational Reports (Fuel, Theft, Idling, etc.)
+// -------------------------------------------------------------
 app.get('/api/reports/summary', async (req, res) => {
   const providedKey = req.headers['x-api-key'] || req.query.apiKey;
   if (providedKey !== CLIENT_API_KEY) {
-    return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+    return res.status(401).json({ status: 'error', message: 'Unauthorized: Invalid API key' });
   }
 
-  // Target Parameters
+  // Pre-configured for Alok Buildtech (Template 9, Group 28314498)
   const resourceId = parseInt(req.query.resourceId) || 28310909;
   const templateId = parseInt(req.query.templateId) || 9;
   const objectId = parseInt(req.query.objectId) || 28314498;
 
-  // Defaults to target interval
-  const from = parseInt(req.query.from) || 1788546600;
-  const to = parseInt(req.query.to) || 1788892199;
+  const targetSection = req.query.section ? String(req.query.section).toLowerCase() : null;
+  const specificTableIndex = req.query.tableIndex !== undefined ? parseInt(req.query.tableIndex) : null;
+
+  // Dynamic interval: Today at 00:00:00 IST to current timestamp
+  const now = new Date();
+  const istOffsetMs = 5.5 * 60 * 60 * 1000;
+  const istNow = new Date(now.getTime() + istOffsetMs);
+  const istMidnight = new Date(Date.UTC(
+    istNow.getUTCFullYear(),
+    istNow.getUTCMonth(),
+    istNow.getUTCDate(),
+    0, 0, 0
+  ));
+
+  const defaultFrom = Math.floor((istMidnight.getTime() - istOffsetMs) / 1000);
+  const defaultTo = Math.floor(Date.now() / 1000);
+
+  const from = parseInt(req.query.from) || defaultFrom;
+  const to = parseInt(req.query.to) || defaultTo;
 
   try {
     let eid = await getSession();
 
-    // 1. Run the report
+    // Direct synchronous report execution
     const execParams = {
       reportResourceId: resourceId,
       reportTemplateId: templateId,
       reportObjectId: objectId,
       reportObjectSecId: 0,
-      interval: {
-        from: from,
-        to: to,
-        flags: 16777216
-      }
+      interval: { from, to, flags: 16777216 }
     };
 
     let execRes = await axios.get(WIALON_URL, {
@@ -165,47 +172,80 @@ app.get('/api/reports/summary', async (req, res) => {
       await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
       return res.json({
         status: 'empty',
-        message: 'No operational data found for this group/interval.',
+        message: 'No report tables generated for this interval.',
         data: []
       });
     }
 
-    // 2. Fetch rows (up to 1,000 units)
-    const rowParams = {
-      tableIndex: 0,
-      config: {
-        type: 'range',
-        data: { from: 0, to: 1000, level: 0 }
-      }
-    };
-
-    const rowsRes = await axios.get(WIALON_URL, {
-      params: { svc: 'report/select_result_rows', params: JSON.stringify(rowParams), sid: eid }
-    });
-
-    // 3. Clear report memory from Wialon
-    await axios.get(WIALON_URL, {
-      params: { svc: 'report/cleanup_result', params: '{}', sid: eid }
-    });
-
-    const rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
-
-    // 4. Map Template 9 columns directly into clean typed metrics
-    const fleetData = rawRows.map((row, idx) => {
-      const cols = (row.c || []).map((c) => (typeof c === 'object' ? c.t : c));
-      return {
-        index: idx + 1,
-        vehicleName: cols[1] || 'Unknown Vehicle',
-        distanceKm: parseMetric(cols[2]),
-        engineHoursFormatted: cols[3] || '0:00:00',
-        engineHoursDecimal: parseDurationToHours(cols[3]),
-        fuelConsumedLiters: parseMetric(cols[4]),
-        fuelOpeningLiters: parseMetric(cols[5]),
-        fuelClosingLiters: parseMetric(cols[6]),
-        refuelingLiters: parseMetric(cols[7]),
-        drainedLiters: parseMetric(cols[8])
+    // Helper function to extract and format rows for any section table
+    async function fetchTableData(index) {
+      const rowParams = {
+        tableIndex: index,
+        config: { type: 'range', data: { from: 0, to: 1000, level: 0 } }
       };
-    });
+      const rowsRes = await axios.get(WIALON_URL, {
+        params: { svc: 'report/select_result_rows', params: JSON.stringify(rowParams), sid: eid }
+      });
+
+      const headers = reportTables[index]?.header || [];
+      const rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
+
+      const rows = rawRows.map((row, rIdx) => {
+        const cols = (row.c || []).map((c) => (typeof c === 'object' ? c.t : c));
+        const rowData = {
+          index: rIdx + 1,
+          vehicleName: row.t || cols[1] || cols[0] || 'Unknown'
+        };
+
+        headers.forEach((header, hIdx) => {
+          if (cols[hIdx] !== undefined) {
+            rowData[header || `col_${hIdx}`] = cols[hIdx];
+          }
+        });
+
+        return rowData;
+      });
+
+      return {
+        tableIndex: index,
+        sectionName: reportTables[index]?.label || reportTables[index]?.name || `Table_${index}`,
+        totalRows: rows.length,
+        headers,
+        rows
+      };
+    }
+
+    let responsePayload;
+
+    // Fetch all report tabs together
+    if (targetSection === 'all') {
+      const allSections = [];
+      for (let i = 0; i < reportTables.length; i++) {
+        const tableData = await fetchTableData(i);
+        allSections.push(tableData);
+      }
+      responsePayload = { sections: allSections };
+    } else {
+      // Fetch a specific section index or keyword
+      let targetIdx = 0;
+
+      if (specificTableIndex !== null && specificTableIndex < reportTables.length) {
+        targetIdx = specificTableIndex;
+      } else if (targetSection) {
+        const found = reportTables.findIndex(
+          (t) =>
+            (t.label && t.label.toLowerCase().includes(targetSection)) ||
+            (t.name && t.name.toLowerCase().includes(targetSection))
+        );
+        if (found !== -1) targetIdx = found;
+      }
+
+      const tableData = await fetchTableData(targetIdx);
+      responsePayload = tableData;
+    }
+
+    // Always release Wialon memory buffer
+    await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
 
     res.json({
       status: 'success',
@@ -213,7 +253,7 @@ app.get('/api/reports/summary', async (req, res) => {
         resourceId,
         templateId,
         objectId,
-        groupName: reportTables[0]?.label || 'Summary'
+        availableSections: reportTables.map((t, idx) => ({ index: idx, name: t.label || t.name }))
       },
       period: {
         fromTimestamp: from,
@@ -221,14 +261,84 @@ app.get('/api/reports/summary', async (req, res) => {
         fromDate: new Date(from * 1000).toISOString(),
         toDate: new Date(to * 1000).toISOString()
       },
-      totalVehicles: fleetData.length,
-      data: fleetData
+      ...responsePayload
     });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
 });
 
+// -------------------------------------------------------------
+// 3. Inspect Available Report Templates inside Resource
+// -------------------------------------------------------------
+app.get('/api/reports/list', async (req, res) => {
+  const providedKey = req.headers['x-api-key'] || req.query.apiKey;
+  if (providedKey !== CLIENT_API_KEY) {
+    return res.status(401).json({ status: 'error', message: 'Unauthorized: Invalid API key' });
+  }
+
+  const targetResourceId = parseInt(req.query.resourceId) || 28310909;
+
+  try {
+    let eid = await getSession();
+
+    const searchParams = {
+      spec: {
+        itemsType: 'avl_resource',
+        propName: 'sys_name',
+        propValueMask: '*',
+        sortType: 'sys_name'
+      },
+      force: 1,
+      flags: 8193,
+      from: 0,
+      to: 0
+    };
+
+    let result = await axios.get(WIALON_URL, {
+      params: { svc: 'core/search_items', params: JSON.stringify(searchParams), sid: eid }
+    });
+
+    if (result.data.error === 1) {
+      sessionId = null;
+      eid = await getSession();
+      result = await axios.get(WIALON_URL, {
+        params: { svc: 'core/search_items', params: JSON.stringify(searchParams), sid: eid }
+      });
+    }
+
+    const resources = result.data.items || [];
+    const matchedResource = resources.find((r) => r.id === targetResourceId) || resources[0];
+
+    if (!matchedResource) {
+      return res.status(404).json({ status: 'error', message: 'Resource not found' });
+    }
+
+    const rawTemplates = matchedResource.rep || {};
+    const templateList = Object.keys(rawTemplates).map((id) => {
+      const t = rawTemplates[id];
+      return {
+        templateId: parseInt(id),
+        templateName: t.n,
+        reportType: t.ct,
+        tablesCount: (t.tbl || []).length,
+        tableNames: (t.tbl || []).map((tb) => tb.n)
+      };
+    });
+
+    res.json({
+      status: 'success',
+      resourceId: matchedResource.id,
+      resourceName: matchedResource.nm,
+      totalTemplates: templateList.length,
+      templates: templateList
+    });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// Bind to 0.0.0.0 for containerized hosting on Render
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Alok Buildtech API service running on port ${PORT}`);
 });
