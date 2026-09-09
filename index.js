@@ -8,25 +8,40 @@ app.use(express.json({ limit: '10mb' }));
 const PORT = process.env.PORT || 10000;
 const WIALON_URL = 'https://hst-api.wialon.com/wialon/ajax.html';
 
-// Alok Buildtech Configuration
 const TOKEN = process.env.WIALON_TOKEN;
 const CLIENT_API_KEY = process.env.CLIENT_API_KEY || 'alok_buidtech_abpl@9000';
+const DEFAULT_RESOURCE_ID = 28310909;
+const DEFAULT_GROUP_ID = 28314498;
+
+// Central Template Registry for Alok Buildtech
+const ALOK_TEMPLATES = {
+  // Group Reports (Target: Unit Group ID 28314498)
+  machine_group:   { templateId: 3,  type: 'avl_unit_group', defaultObjectId: DEFAULT_GROUP_ID, name: 'Machine Group Report' },
+  trucks_group:    { templateId: 4,  type: 'avl_unit_group', defaultObjectId: DEFAULT_GROUP_ID, name: 'Trucks Group Report' },
+  tm_operation:    { templateId: 5,  type: 'avl_unit_group', defaultObjectId: DEFAULT_GROUP_ID, name: 'TM Operation Report' },
+  admin_status:    { templateId: 6,  type: 'avl_unit_group', defaultObjectId: DEFAULT_GROUP_ID, name: 'Admin All Unit Status Report' },
+  api_machine:     { templateId: 9,  type: 'avl_unit_group', defaultObjectId: DEFAULT_GROUP_ID, name: 'API Report Machine (v1)' },
+  api_machine_v2:  { templateId: 11, type: 'avl_unit_group', defaultObjectId: DEFAULT_GROUP_ID, name: 'API Report Machine (v2)' },
+
+  // Single Unit Reports (Target: Single Vehicle unitId)
+  trucks_unit:     { templateId: 1,  type: 'avl_unit', defaultObjectId: null, name: 'Trucks Operational (Single Unit)' },
+  machine_unit:    { templateId: 2,  type: 'avl_unit', defaultObjectId: null, name: 'Machine Operational (Single Unit)' },
+  browsers_unit_1: { templateId: 7,  type: 'avl_unit', defaultObjectId: null, name: 'Browsers Operational 1' },
+  browsers_unit_2: { templateId: 8,  type: 'avl_unit', defaultObjectId: null, name: 'Browsers Operational 2' },
+  tm_unit:         { templateId: 10, type: 'avl_unit', defaultObjectId: null, name: 'TM Operational (Single Unit)' }
+};
 
 let sessionId = null;
 
-// Reusable Wialon session recovery function
 async function getSession() {
   if (sessionId) return sessionId;
 
   const response = await axios.get(WIALON_URL, {
-    params: {
-      svc: 'token/login',
-      params: JSON.stringify({ token: TOKEN })
-    }
+    params: { svc: 'token/login', params: JSON.stringify({ token: TOKEN }) }
   });
 
   if (response.data.error) {
-    throw new Error(`Wialon login failed with error code: ${response.data.error}`);
+    throw new Error(`Wialon login failed: ${response.data.error}`);
   }
 
   sessionId = response.data.eid;
@@ -37,39 +52,22 @@ async function getSession() {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    service: 'Alok Buildtech Fleet Analytics API'
+    service: 'Alok Buildtech Unified Multi-Template Fleet API'
   });
 });
 
-// -------------------------------------------------------------
-// 1. Real-Time Vehicle Tracking (Live Speed, GPS, Heading)
-// -------------------------------------------------------------
+// 1. Real-Time Tracking
 app.get('/api/vehicles', async (req, res) => {
-  const providedKey = req.headers['x-api-key'] || req.query.apiKey;
-  if (providedKey !== CLIENT_API_KEY) {
-    return res.status(401).json({ status: 'error', message: 'Unauthorized: Invalid API key' });
-  }
+  const key = req.headers['x-api-key'] || req.query.apiKey;
+  if (key !== CLIENT_API_KEY) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
 
-  const page = parseInt(req.query.page) || 1;
-  const limit = parseInt(req.query.limit) || 0;
   const searchMask = req.query.search ? `*${req.query.search}*` : '*';
-  const from = limit > 0 ? (page - 1) * limit : 0;
-  const to = limit > 0 ? from + limit - 1 : 0;
 
   try {
     let eid = await getSession();
-
     const searchParams = {
-      spec: {
-        itemsType: 'avl_unit',
-        propName: 'sys_name',
-        propValueMask: searchMask,
-        sortType: 'sys_name'
-      },
-      force: 1,
-      flags: 1025,
-      from,
-      to
+      spec: { itemsType: 'avl_unit', propName: 'sys_name', propValueMask: searchMask, sortType: 'sys_name' },
+      force: 1, flags: 1025, from: 0, to: 0
     };
 
     let result = await axios.get(WIALON_URL, {
@@ -84,54 +82,43 @@ app.get('/api/vehicles', async (req, res) => {
       });
     }
 
-    const vehicles = (result.data.items || []).map((unit) => ({
-      unitId: unit.id,
-      unitName: unit.nm,
-      latitude: unit.pos ? unit.pos.y : null,
-      longitude: unit.pos ? unit.pos.x : null,
-      speedKmh: unit.pos ? unit.pos.s : 0,
-      heading: unit.pos ? unit.pos.c : 0,
-      lastSeen: unit.pos ? new Date(unit.pos.t * 1000).toISOString() : null
+    const vehicles = (result.data.items || []).map((u) => ({
+      unitId: u.id,
+      unitName: u.nm,
+      latitude: u.pos?.y || null,
+      longitude: u.pos?.x || null,
+      speedKmh: u.pos?.s || 0,
+      heading: u.pos?.c || 0,
+      lastSeen: u.pos ? new Date(u.pos.t * 1000).toISOString() : null
     }));
 
-    res.json({
-      status: 'success',
-      totalCount: result.data.totalItemsCount || vehicles.length,
-      returnedCount: vehicles.length,
-      data: vehicles
-    });
+    res.json({ status: 'success', totalCount: vehicles.length, data: vehicles });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
 });
 
-// -------------------------------------------------------------
-// 2. Multi-Section Operational Reports (Fuel, Theft, Idling, etc.)
-// -------------------------------------------------------------
+// 2. Universal Report Runner (Supports all templates by ID or Name)
 app.get('/api/reports/summary', async (req, res) => {
-  const providedKey = req.headers['x-api-key'] || req.query.apiKey;
-  if (providedKey !== CLIENT_API_KEY) {
-    return res.status(401).json({ status: 'error', message: 'Unauthorized: Invalid API key' });
-  }
+  const key = req.headers['x-api-key'] || req.query.apiKey;
+  if (key !== CLIENT_API_KEY) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
 
-  // Pre-configured for Alok Buildtech (Template 9, Group 28314498)
-  const resourceId = parseInt(req.query.resourceId) || 28310909;
-  const templateId = parseInt(req.query.templateId) || 9;
-  const objectId = parseInt(req.query.objectId) || 28314498;
+  // Resolve template via ?report=name or ?templateId=number
+  const reportSlug = req.query.report ? String(req.query.report).toLowerCase() : null;
+  const namedConfig = reportSlug ? ALOK_TEMPLATES[reportSlug] : null;
+
+  const resourceId = parseInt(req.query.resourceId) || DEFAULT_RESOURCE_ID;
+  const templateId = parseInt(req.query.templateId) || (namedConfig ? namedConfig.templateId : 9);
+  const objectId   = parseInt(req.query.objectId)   || (namedConfig?.defaultObjectId) || DEFAULT_GROUP_ID;
 
   const targetSection = req.query.section ? String(req.query.section).toLowerCase() : null;
   const specificTableIndex = req.query.tableIndex !== undefined ? parseInt(req.query.tableIndex) : null;
 
-  // Dynamic interval: Today at 00:00:00 IST to current timestamp
+  // Real-Time dynamic "Today" calculation in IST (UTC+5:30)
   const now = new Date();
   const istOffsetMs = 5.5 * 60 * 60 * 1000;
   const istNow = new Date(now.getTime() + istOffsetMs);
-  const istMidnight = new Date(Date.UTC(
-    istNow.getUTCFullYear(),
-    istNow.getUTCMonth(),
-    istNow.getUTCDate(),
-    0, 0, 0
-  ));
+  const istMidnight = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate(), 0, 0, 0));
 
   const defaultFrom = Math.floor((istMidnight.getTime() - istOffsetMs) / 1000);
   const defaultTo = Math.floor(Date.now() / 1000);
@@ -142,7 +129,6 @@ app.get('/api/reports/summary', async (req, res) => {
   try {
     let eid = await getSession();
 
-    // Direct synchronous report execution
     const execParams = {
       reportResourceId: resourceId,
       reportTemplateId: templateId,
@@ -164,20 +150,15 @@ app.get('/api/reports/summary', async (req, res) => {
     }
 
     if (execRes.data.error) {
-      return res.status(400).json({ error: `Wialon exec_report error: ${execRes.data.error}` });
+      return res.status(400).json({ error: `Wialon exec_report error code: ${execRes.data.error}` });
     }
 
     const reportTables = execRes.data.reportResult?.tables || [];
     if (reportTables.length === 0) {
       await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
-      return res.json({
-        status: 'empty',
-        message: 'No report tables generated for this interval.',
-        data: []
-      });
+      return res.json({ status: 'empty', message: 'No tables generated for this interval.', data: [] });
     }
 
-    // Helper function to extract and format rows for any section table
     async function fetchTableData(index) {
       const rowParams = {
         tableIndex: index,
@@ -194,13 +175,11 @@ app.get('/api/reports/summary', async (req, res) => {
         const cols = (row.c || []).map((c) => (typeof c === 'object' ? c.t : c));
         const rowData = {
           index: rIdx + 1,
-          vehicleName: row.t || cols[1] || cols[0] || 'Unknown'
+          entityName: row.t || cols[1] || cols[0] || 'Unknown'
         };
 
-        headers.forEach((header, hIdx) => {
-          if (cols[hIdx] !== undefined) {
-            rowData[header || `col_${hIdx}`] = cols[hIdx];
-          }
+        headers.forEach((h, hIdx) => {
+          if (cols[hIdx] !== undefined) rowData[h || `col_${hIdx}`] = cols[hIdx];
         });
 
         return rowData;
@@ -217,34 +196,27 @@ app.get('/api/reports/summary', async (req, res) => {
 
     let responsePayload;
 
-    // Fetch all report tabs together
     if (targetSection === 'all') {
       const allSections = [];
       for (let i = 0; i < reportTables.length; i++) {
-        const tableData = await fetchTableData(i);
-        allSections.push(tableData);
+        const tData = await fetchTableData(i);
+        allSections.push(tData);
       }
       responsePayload = { sections: allSections };
     } else {
-      // Fetch a specific section index or keyword
       let targetIdx = 0;
-
       if (specificTableIndex !== null && specificTableIndex < reportTables.length) {
         targetIdx = specificTableIndex;
       } else if (targetSection) {
-        const found = reportTables.findIndex(
-          (t) =>
-            (t.label && t.label.toLowerCase().includes(targetSection)) ||
-            (t.name && t.name.toLowerCase().includes(targetSection))
+        const found = reportTables.findIndex((t) =>
+          (t.label && t.label.toLowerCase().includes(targetSection)) ||
+          (t.name && t.name.toLowerCase().includes(targetSection))
         );
         if (found !== -1) targetIdx = found;
       }
-
-      const tableData = await fetchTableData(targetIdx);
-      responsePayload = tableData;
+      responsePayload = await fetchTableData(targetIdx);
     }
 
-    // Always release Wialon memory buffer
     await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
 
     res.json({
@@ -253,6 +225,7 @@ app.get('/api/reports/summary', async (req, res) => {
         resourceId,
         templateId,
         objectId,
+        reportName: namedConfig?.name || `Template ${templateId}`,
         availableSections: reportTables.map((t, idx) => ({ index: idx, name: t.label || t.name }))
       },
       period: {
@@ -268,31 +241,18 @@ app.get('/api/reports/summary', async (req, res) => {
   }
 });
 
-// -------------------------------------------------------------
-// 3. Inspect Available Report Templates inside Resource
-// -------------------------------------------------------------
+// 3. Template Inventory Explorer
 app.get('/api/reports/list', async (req, res) => {
-  const providedKey = req.headers['x-api-key'] || req.query.apiKey;
-  if (providedKey !== CLIENT_API_KEY) {
-    return res.status(401).json({ status: 'error', message: 'Unauthorized: Invalid API key' });
-  }
+  const key = req.headers['x-api-key'] || req.query.apiKey;
+  if (key !== CLIENT_API_KEY) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
 
-  const targetResourceId = parseInt(req.query.resourceId) || 28310909;
+  const targetResourceId = parseInt(req.query.resourceId) || DEFAULT_RESOURCE_ID;
 
   try {
     let eid = await getSession();
-
     const searchParams = {
-      spec: {
-        itemsType: 'avl_resource',
-        propName: 'sys_name',
-        propValueMask: '*',
-        sortType: 'sys_name'
-      },
-      force: 1,
-      flags: 8193,
-      from: 0,
-      to: 0
+      spec: { itemsType: 'avl_resource', propName: 'sys_name', propValueMask: '*', sortType: 'sys_name' },
+      force: 1, flags: 8193, from: 0, to: 0
     };
 
     let result = await axios.get(WIALON_URL, {
@@ -310,35 +270,30 @@ app.get('/api/reports/list', async (req, res) => {
     const resources = result.data.items || [];
     const matchedResource = resources.find((r) => r.id === targetResourceId) || resources[0];
 
-    if (!matchedResource) {
-      return res.status(404).json({ status: 'error', message: 'Resource not found' });
-    }
+    if (!matchedResource) return res.status(404).json({ status: 'error', message: 'Resource not found' });
 
     const rawTemplates = matchedResource.rep || {};
-    const templateList = Object.keys(rawTemplates).map((id) => {
-      const t = rawTemplates[id];
-      return {
-        templateId: parseInt(id),
-        templateName: t.n,
-        reportType: t.ct,
-        tablesCount: (t.tbl || []).length,
-        tableNames: (t.tbl || []).map((tb) => tb.n)
-      };
-    });
+    const templateList = Object.keys(rawTemplates).map((id) => ({
+      templateId: parseInt(id),
+      templateName: rawTemplates[id].n,
+      reportType: rawTemplates[id].ct,
+      tablesCount: (rawTemplates[id].tbl || []).length,
+      tableNames: (rawTemplates[id].tbl || []).map((tb) => tb.n)
+    }));
 
     res.json({
       status: 'success',
       resourceId: matchedResource.id,
       resourceName: matchedResource.nm,
       totalTemplates: templateList.length,
-      templates: templateList
+      templates: templateList,
+      registeredShortcuts: Object.keys(ALOK_TEMPLATES)
     });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
 });
 
-// Bind to 0.0.0.0 for containerized hosting on Render
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Alok Buildtech API service running on port ${PORT}`);
+  console.log(`Alok Buildtech Unified API live on port ${PORT}`);
 });
