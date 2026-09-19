@@ -115,9 +115,10 @@ app.get('/api/reports/summary', async (req, res) => {
   }
 
   // Pre-configured for Alok Buildtech (Template 9, Group 28314498)
-  const resourceId = parseInt(req.query.resourceId) || 28310909;
-  const templateId = parseInt(req.query.templateId) || 9;
-  const objectId = parseInt(req.query.objectId) || 28314498;
+// Updated default parameters for Alok Buildtech
+const DEFAULT_RESOURCE_ID = 26688401;
+const DEFAULT_TEMPLATE_ID = 1;
+const DEFAULT_OBJECT_ID   = 28314498;
 
   const targetSection = req.query.section ? String(req.query.section).toLowerCase() : null;
   const specificTableIndex = req.query.tableIndex !== undefined ? parseInt(req.query.tableIndex) : null;
