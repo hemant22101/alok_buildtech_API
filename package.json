@@ -1,13 +1,13 @@
 {
-  "name": "alok_buildtech_api",
+  "name": "alok-buildtech-api",
   "version": "1.0.0",
-  "description": "Fleet analytics and reporting API for Alok Buildtech",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "axios": "^1.7.0",
+    "axios": "^1.7.2",
+    "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2"
   }
