@@ -4,7 +4,6 @@ const axios = require('axios');
 const cors = require('cors');
 
 const app = express();
-
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
@@ -14,19 +13,14 @@ const WIALON_URL = 'https://hst-api.wialon.com/wialon/ajax.html';
 const TOKEN = process.env.WIALON_TOKEN;
 const CLIENT_API_KEY = process.env.CLIENT_API_KEY || 'alok_buidtech_abpl@9000';
 
-// Default Target Identifiers
 const DEFAULT_RESOURCE_ID = 26688401;
 const DEFAULT_TEMPLATE_ID = 1;
 const DEFAULT_OBJECT_ID   = 28314498;
-
-// Fallback session ID provided
-const HARDCODED_SID = '044e53d2844a9e4087995cb0860781c9';
 
 let dynamicSessionId = null;
 let hardwareMapCache = null;
 let lastCacheTime = 0;
 
-// Session Management: checks passed SID -> cached session -> token login
 async function getSession(customSid) {
   if (customSid) return customSid;
   if (dynamicSessionId) return dynamicSessionId;
@@ -41,20 +35,17 @@ async function getSession(customSid) {
         return dynamicSessionId;
       }
     } catch (e) {
-      console.warn('Token login attempt failed, falling back to static SID.');
+      console.warn('Token login error, using fallback');
     }
   }
-
-  return HARDCODED_SID;
+  return '0425522b51252d6a87cc53ac5bc7f073';
 }
 
-// Key normalizer for whitespace/casing variations
 function normalizeKey(str) {
   if (!str) return '';
   return String(str).toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
-// Hardware Unit Resolver (Retrieves IMEI/UID)
 async function getUnitHardwareMap(eid) {
   const now = Date.now();
   if (hardwareMapCache && (now - lastCacheTime < 15 * 60 * 1000)) {
@@ -82,9 +73,7 @@ async function getUnitHardwareMap(eid) {
         map[unit.nm.trim().toLowerCase()] = cleanUid;
         map[normalizeKey(unit.nm)] = cleanUid;
       }
-      if (unit.id) {
-        map[String(unit.id)] = cleanUid;
-      }
+      if (unit.id) map[String(unit.id)] = cleanUid;
     }
   });
 
@@ -93,18 +82,26 @@ async function getUnitHardwareMap(eid) {
   return map;
 }
 
-// Column matching helper
+// Current IST window helper
+function getTodayISTInterval() {
+  const now = new Date();
+  const istOffsetMs = 5.5 * 60 * 60 * 1000;
+  const istNow = new Date(now.getTime() + istOffsetMs);
+  const istMidnight = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate(), 0, 0, 0));
+  const from = Math.floor((istMidnight.getTime() - istOffsetMs) / 1000);
+  const to = Math.floor(Date.now() / 1000);
+  return { from, to };
+}
+
 const getColVal = (headers, cols, keyword) => {
   const idx = headers.findIndex(h => (h || '').toLowerCase().trim() === keyword.toLowerCase().trim());
   return idx !== -1 && cols[idx] !== undefined ? cols[idx] : "0.00";
 };
 
-// Health Check
 app.get('/', (req, res) => {
-  res.json({ status: 'online', service: 'Alok Buildtech Telematics & Fuel API' });
+  res.json({ status: 'online' });
 });
 
-// Summary Endpoint
 app.get('/api/reports/summary', async (req, res) => {
   const key = req.headers['x-api-key'] || req.query.apiKey;
   if (key !== CLIENT_API_KEY) {
@@ -115,18 +112,16 @@ app.get('/api/reports/summary', async (req, res) => {
   const templateId = parseInt(req.query.templateId) || DEFAULT_TEMPLATE_ID;
   const objectId   = parseInt(req.query.objectId)   || DEFAULT_OBJECT_ID;
 
-  // Uses custom query interval or pre-set range
-  const from = parseInt(req.query.from) || 1788201000;
-  const to   = parseInt(req.query.to)   || 1790101799;
+  // Use dynamic IST today if no manual interval passed
+  const today = getTodayISTInterval();
+  const from = parseInt(req.query.from) || today.from;
+  const to   = parseInt(req.query.to)   || today.to;
   const flags = parseInt(req.query.flags) || 16777216;
 
   try {
     let eid = await getSession(req.query.sid);
-
-    // 1. Fetch Hardware IDs map
     const hardwareMap = await getUnitHardwareMap(eid);
 
-    // 2. Execute Wialon Report
     const execParams = {
       reportResourceId: resourceId,
       reportTemplateId: templateId,
@@ -141,7 +136,6 @@ app.get('/api/reports/summary', async (req, res) => {
       params: { svc: 'report/exec_report', params: JSON.stringify(execParams), sid: eid }
     });
 
-    // Auto-recovery if session expired
     if (execRes.data.error === 1) {
       dynamicSessionId = null;
       eid = await getSession();
@@ -151,7 +145,7 @@ app.get('/api/reports/summary', async (req, res) => {
     }
 
     if (execRes.data.error) {
-      return res.status(400).json({ error: `Wialon report error code: ${execRes.data.error}` });
+      return res.status(400).json({ error: `Wialon error code: ${execRes.data.error}` });
     }
 
     const reportTables = execRes.data.reportResult?.tables || [];
@@ -160,9 +154,12 @@ app.get('/api/reports/summary', async (req, res) => {
       return res.json({ sid: eid, data: [] });
     }
 
-    // 3. Extract Rows from Table 0
+    // Auto-detect which table actually has rows (> 0)
+    let targetTableIndex = reportTables.findIndex(t => (t.rows || 0) > 0);
+    if (targetTableIndex === -1) targetTableIndex = 0; // fallback
+
     const rowParams = {
-      tableIndex: 0,
+      tableIndex: targetTableIndex,
       config: { type: 'range', data: { from: 0, to: 1000, level: 0 } }
     };
 
@@ -170,10 +167,9 @@ app.get('/api/reports/summary', async (req, res) => {
       params: { svc: 'report/select_result_rows', params: JSON.stringify(rowParams), sid: eid }
     });
 
-    const headers = reportTables[0]?.header || [];
+    const headers = reportTables[targetTableIndex]?.header || [];
     const rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
 
-    // 4. Map clean fields with Hardware Unique ID
     const cleanRows = rawRows.map(row => {
       const cols = (row.c || []).map(c => (typeof c === 'object' ? c.t : c));
 
@@ -201,10 +197,8 @@ app.get('/api/reports/summary', async (req, res) => {
       };
     });
 
-    // Cleanup session execution memory on Wialon
     await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
 
-    // Output with session ID included
     res.json({
       sid: eid,
       data: cleanRows
