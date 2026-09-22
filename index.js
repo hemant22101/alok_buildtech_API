@@ -18,19 +18,54 @@ const DEFAULT_TEMPLATE_ID = 1;
 const DEFAULT_OBJECT_ID   = 28314498;
 
 let sessionId = null;
+let hardwareMapCache = null;
+let lastCacheTime = 0;
 
-// Session Management with auto-relogin
+// Session management
 async function getSession() {
   if (sessionId) return sessionId;
   const res = await axios.get(WIALON_URL, {
     params: { svc: 'token/login', params: JSON.stringify({ token: TOKEN }) }
   });
-  if (res.data.error) throw new Error(`Wialon login failed: ${res.data.error}`);
+  if (res.data.error) throw new Error(`Wialon login error: ${res.data.error}`);
   sessionId = res.data.eid;
   return sessionId;
 }
 
-// IST dynamic timeframe helper
+// 1. Fetch and cache Unit Name -> GPS Unique ID (IMEI)
+async function getUnitHardwareMap(eid) {
+  const now = Date.now();
+  // Cache for 15 minutes so it doesn't slow down requests
+  if (hardwareMapCache && (now - lastCacheTime < 15 * 60 * 1000)) {
+    return hardwareMapCache;
+  }
+
+  const searchParams = {
+    spec: { itemsType: 'avl_unit', propName: 'sys_name', propValueMask: '*', sortType: 'sys_name' },
+    force: 1,
+    flags: 1, // Flag 1 returns nm, uid (Hardware ID)
+    from: 0,
+    to: 0
+  };
+
+  const res = await axios.get(WIALON_URL, {
+    params: { svc: 'core/search_items', params: JSON.stringify(searchParams), sid: eid }
+  });
+
+  const map = {};
+  (res.data.items || []).forEach(unit => {
+    if (unit.uid) {
+      if (unit.nm) map[unit.nm.trim().toLowerCase()] = unit.uid;
+      if (unit.id) map[String(unit.id)] = unit.uid;
+    }
+  });
+
+  hardwareMapCache = map;
+  lastCacheTime = now;
+  return map;
+}
+
+// Helper: IST dynamic timeframe
 function getTodayISTInterval() {
   const now = new Date();
   const istOffsetMs = 5.5 * 60 * 60 * 1000;
@@ -41,17 +76,10 @@ function getTodayISTInterval() {
   return { from, to };
 }
 
-// Health check
-app.get('/', (req, res) => {
-  res.json({ status: 'online' });
-});
-
-// Clean Summary Endpoint - Returns ONLY the requested object array
+// Main Endpoint: Returns Clean JSON with Device Unique ID
 app.get('/api/reports/summary', async (req, res) => {
   const key = req.headers['x-api-key'] || req.query.apiKey;
-  if (key !== CLIENT_API_KEY) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+  if (key !== CLIENT_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
 
   const resourceId = parseInt(req.query.resourceId) || DEFAULT_RESOURCE_ID;
   const templateId = parseInt(req.query.templateId) || DEFAULT_TEMPLATE_ID;
@@ -63,6 +91,9 @@ app.get('/api/reports/summary', async (req, res) => {
 
   try {
     let eid = await getSession();
+
+    // Fetch the hardware mapping first
+    const hardwareMap = await getUnitHardwareMap(eid);
 
     const execParams = {
       reportResourceId: resourceId,
@@ -85,7 +116,7 @@ app.get('/api/reports/summary', async (req, res) => {
     }
 
     if (execRes.data.error) {
-      return res.status(400).json({ error: `Wialon error code: ${execRes.data.error}` });
+      return res.status(400).json({ error: `Wialon report error: ${execRes.data.error}` });
     }
 
     const reportTables = execRes.data.reportResult?.tables || [];
@@ -106,21 +137,24 @@ app.get('/api/reports/summary', async (req, res) => {
     const headers = reportTables[0]?.header || [];
     const rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
 
-    // Helper to find column index matching keywords
     const getColVal = (cols, keyword) => {
       const idx = headers.findIndex(h => (h || '').toLowerCase().trim() === keyword.toLowerCase().trim());
       return idx !== -1 && cols[idx] !== undefined ? cols[idx] : "0.00";
     };
 
-    // Filter and map ONLY your requested fields
     const cleanRows = rawRows.map(row => {
       const cols = (row.c || []).map(c => (typeof c === 'object' ? c.t : c));
 
-      // Extract machine name from 'Grouping' or fallback to row.t / column
+      // 1. Extract Machine Name from Grouping
       const groupingVal = getColVal(cols, 'Grouping');
       const machineName = groupingVal !== "0.00" ? groupingVal : (row.t || cols[1] || cols[0] || 'Unknown');
+      const cleanName = String(machineName).trim().toLowerCase();
+
+      // 2. Match with Hardware Map to get GPS Unique ID
+      const uniqueId = hardwareMap[cleanName] || hardwareMap[String(row.i)] || null;
 
       return {
+        "Machine GPS Unique ID": uniqueId,
         "Grouping": String(machineName).trim(),
         "Run KM": getColVal(cols, 'Run KM'),
         "Time Run": getColVal(cols, 'Time Run'),
@@ -132,10 +166,8 @@ app.get('/api/reports/summary', async (req, res) => {
       };
     });
 
-    // Cleanup Wialon session memory
     await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
 
-    // Directly return the raw array without metadata wrappers
     res.json(cleanRows);
 
   } catch (err) {
@@ -143,7 +175,6 @@ app.get('/api/reports/summary', async (req, res) => {
   }
 });
 
-// Port binding on 0.0.0.0 for Render & Cloud Run compatibility
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log(`API running on port ${PORT}`);
 });
