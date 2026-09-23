@@ -11,7 +11,7 @@ app.use(express.json({ limit: '10mb' }));
 const PORT = process.env.PORT || 10000;
 const WIALON_URL = 'https://hst-api.wialon.com/wialon/ajax.html';
 
-// Account credentials & targets
+// Account credentials & target defaults
 const TOKEN = process.env.WIALON_TOKEN;
 const CLIENT_API_KEY = process.env.CLIENT_API_KEY || 'alok_buidtech_abpl@9000';
 
@@ -23,7 +23,7 @@ let sessionId = null;
 let hardwareMapCache = null;
 let lastCacheTime = 0;
 
-// Session Management: auto-logs in and regenerates session on expiration
+// Session Management with auto-relogin
 async function getSession() {
   if (sessionId) return sessionId;
 
@@ -43,7 +43,7 @@ async function getSession() {
   return sessionId;
 }
 
-// Hardware & Unit ID Map: binds unit names to physical IMEI (uid) or permanent Unit ID (id)
+// Hardware & Unit ID Map: Resolves vehicle name to physical IMEI (uid) or Wialon Unit ID (id)
 async function getUnitHardwareMap(eid) {
   const now = Date.now();
   if (hardwareMapCache && (now - lastCacheTime < 15 * 60 * 1000)) {
@@ -53,7 +53,7 @@ async function getUnitHardwareMap(eid) {
   const searchParams = {
     spec: { itemsType: 'avl_unit', propName: 'sys_name', propValueMask: '*', sortType: 'sys_name' },
     force: 1,
-    flags: 268435457, // Requests base info + connectivity hardware block
+    flags: 268435457,
     from: 0,
     to: 0
   };
@@ -64,13 +64,12 @@ async function getUnitHardwareMap(eid) {
 
   const map = {};
   (res.data.items || []).forEach(unit => {
-    // 1. Physical IMEI/UID (if present) -> 2. Permanent Wialon Unit ID (e.g. 28679423)
     const identifier = unit.uid || (unit.net ? unit.net.uid : null) || unit.id;
 
     if (unit.nm) {
       const cleanName = unit.nm.trim().toLowerCase();
       map[cleanName] = identifier;
-      map[cleanName.replace(/[^a-z0-9]/g, '')] = identifier; // Strips spaces/symbols
+      map[cleanName.replace(/[^a-z0-9]/g, '')] = identifier;
     }
     if (unit.id) {
       map[String(unit.id)] = identifier;
@@ -82,7 +81,7 @@ async function getUnitHardwareMap(eid) {
   return map;
 }
 
-// IST dynamic "Today" timeframe helper (UTC+5:30)
+// Dynamic IST timeframe helper (00:00:00 IST to current timestamp)
 function getTodayISTInterval() {
   const now = new Date();
   const istOffsetMs = 5.5 * 60 * 60 * 1000;
@@ -98,7 +97,7 @@ app.get('/', (req, res) => {
   res.json({ status: 'online', service: 'Alok Buildtech Telematics & Fuel API' });
 });
 
-// Clean Summary Endpoint - Returns only the minimal array with Machine GPS Unique ID
+// Summary Report Endpoint
 app.get('/api/reports/summary', async (req, res) => {
   const key = req.headers['x-api-key'] || req.query.apiKey;
   if (key !== CLIENT_API_KEY) {
@@ -115,11 +114,9 @@ app.get('/api/reports/summary', async (req, res) => {
 
   try {
     let eid = await getSession();
-
-    // 1. Fetch Unit hardware & ID mapping
     const hardwareMap = await getUnitHardwareMap(eid);
 
-    // 2. Execute Wialon Report
+    // 1. Execute report
     const execParams = {
       reportResourceId: resourceId,
       reportTemplateId: templateId,
@@ -151,7 +148,7 @@ app.get('/api/reports/summary', async (req, res) => {
       return res.json([]);
     }
 
-    // 3. Extract Table 0 Rows
+    // 2. Extract rows from Table 0
     const rowParams = {
       tableIndex: 0,
       config: { type: 'range', data: { from: 0, to: 1000, level: 0 } }
@@ -164,23 +161,21 @@ app.get('/api/reports/summary', async (req, res) => {
     const headers = reportTables[0]?.header || [];
     const rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
 
-    // Helper: Match column header value
+    // Header-matching helper
     const getColVal = (cols, keyword) => {
       const idx = headers.findIndex(h => (h || '').toLowerCase().trim() === keyword.toLowerCase().trim());
       return idx !== -1 && cols[idx] !== undefined ? cols[idx] : "0.00";
     };
 
-    // 4. Map only the requested fields
+    // 3. Map exact columns matching the Wialon report view
     const cleanRows = rawRows.map(row => {
       const cols = (row.c || []).map(c => (typeof c === 'object' ? c.t : c));
 
-      // Extract machine name from 'Grouping' column
       const groupingVal = getColVal(cols, 'Grouping');
       const machineName = groupingVal !== "0.00" ? groupingVal : (row.t || cols[1] || cols[0] || 'Unknown');
       const rawName = String(machineName).trim();
       const normKey = rawName.toLowerCase().replace(/[^a-z0-9]/g, '');
 
-      // Resolve Unique ID: exact name -> normalized name -> row unit id (row.i)
       const uniqueId = hardwareMap[rawName.toLowerCase()] 
                     || hardwareMap[normKey] 
                     || (row.i ? hardwareMap[String(row.i)] : null) 
@@ -193,16 +188,15 @@ app.get('/api/reports/summary', async (req, res) => {
         "Time Run": getColVal(cols, 'Time Run'),
         "Fuel Opening": getColVal(cols, 'Fuel Opening'),
         "Fuel Closing": getColVal(cols, 'Fuel Closing'),
-        "Fuel consumed": getColVal(cols, 'Fuel consumed'),
+        "Fuel Consumed": getColVal(cols, 'Fuel Consumed'),
         "Refulling": getColVal(cols, 'Refulling'),
-        "Fuel Consumption": getColVal(cols, 'Fuel Consumption')
+        "Parkings": getColVal(cols, 'Parkings') !== "0.00" ? getColVal(cols, 'Parkings') : "0:00:00"
       };
     });
 
-    // 5. Clean up report memory on Wialon server
+    // 4. Release server report memory
     await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
 
-    // Output the direct array without wrappers
     res.json(cleanRows);
 
   } catch (err) {
@@ -210,7 +204,6 @@ app.get('/api/reports/summary', async (req, res) => {
   }
 });
 
-// Port binding on 0.0.0.0 for Render and Cloud Run
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`API live on port ${PORT}`);
+  console.log(`Server listening on port ${PORT}`);
 });
