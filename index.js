@@ -22,7 +22,7 @@ let sessionId = null;
 let hardwareMapCache = null;
 let lastCacheTime = 0;
 
-// Session Management
+// Session Management with automatic re-login recovery
 async function getSession() {
   if (sessionId) return sessionId;
 
@@ -91,11 +91,96 @@ function getTodayISTInterval() {
   return { from, to };
 }
 
+// Root Health Check
 app.get('/', (req, res) => {
   res.json({ status: 'online', service: 'Alok Buildtech Telematics & Fuel API' });
 });
 
-// Summary Endpoint
+// Diagnostic Inspection Endpoint
+app.get('/api/raw-diagnostic', async (req, res) => {
+  try {
+    let eid = await getSession();
+
+    const from = parseInt(req.query.from) || getTodayISTInterval().from;
+    const to   = parseInt(req.query.to)   || getTodayISTInterval().to;
+
+    const execParams = {
+      reportResourceId: DEFAULT_RESOURCE_ID,
+      reportTemplateId: DEFAULT_TEMPLATE_ID,
+      reportTemplate: null,
+      reportObjectId: DEFAULT_OBJECT_ID,
+      reportObjectSecId: 0,
+      interval: { flags: 16777216, from, to },
+      remoteExec: 1,
+      reportObjectIdList: []
+    };
+
+    let execRes = await axios.get(WIALON_URL, {
+      params: { svc: 'report/exec_report', params: JSON.stringify(execParams), sid: eid }
+    });
+
+    if (execRes.data.error === 1) {
+      sessionId = null;
+      eid = await getSession();
+      execRes = await axios.get(WIALON_URL, {
+        params: { svc: 'report/exec_report', params: JSON.stringify(execParams), sid: eid }
+      });
+    }
+
+    if (execRes.data.error) {
+      return res.status(400).json({ error: `Wialon exec_report error: ${execRes.data.error}` });
+    }
+
+    const reportResult = execRes.data.reportResult;
+    if (!reportResult || !reportResult.tables || reportResult.tables.length === 0) {
+      return res.json({ error: 'No report tables generated', rawReportResult: reportResult });
+    }
+
+    const tablesSummary = [];
+    const tableSamples = {};
+
+    for (let tIdx = 0; tIdx < reportResult.tables.length; tIdx++) {
+      const tMeta = reportResult.tables[tIdx];
+      tablesSummary.push({
+        index: tIdx,
+        name: tMeta.name,
+        label: tMeta.label,
+        rowsReported: tMeta.rows,
+        headers: tMeta.header
+      });
+
+      tableSamples[`table_${tIdx}`] = {};
+
+      for (const lvl of [0, 1]) {
+        const rowsRes = await axios.get(WIALON_URL, {
+          params: {
+            svc: 'report/select_result_rows',
+            params: JSON.stringify({
+              tableIndex: tIdx,
+              config: { type: 'range', data: { from: 0, to: 5, level: lvl } }
+            }),
+            sid: eid
+          }
+        });
+        tableSamples[`table_${tIdx}`][`level_${lvl}`] = rowsRes.data;
+      }
+    }
+
+    await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
+
+    res.json({
+      status: 'success',
+      interval: { from, to },
+      tablesSummary,
+      tableSamples
+    });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Primary Summary Endpoint
 app.get('/api/reports/summary', async (req, res) => {
   const key = req.headers['x-api-key'] || req.query.apiKey;
   if (key !== CLIENT_API_KEY) {
@@ -120,11 +205,7 @@ app.get('/api/reports/summary', async (req, res) => {
       reportTemplate: null,
       reportObjectId: objectId,
       reportObjectSecId: 0,
-      interval: {
-        flags: 16777216,
-        from: from,
-        to: to
-      },
+      interval: { flags: 16777216, from, to },
       remoteExec: 1,
       reportObjectIdList: []
     };
@@ -151,13 +232,7 @@ app.get('/api/reports/summary', async (req, res) => {
       return res.json([]);
     }
 
-    const headers = reportTables[0]?.header || [];
-
-    // CRUCIAL: Try Level 1 FIRST (where Detalization vehicle rows reside), then Level 0
-    let rawRows = [];
-    
-    // Attempt Level 1 (Child rows / Detalization items)
-    const level1Res = await axios.get(WIALON_URL, {
+    let rowsRes = await axios.get(WIALON_URL, {
       params: {
         svc: 'report/select_result_rows',
         params: JSON.stringify({
@@ -168,11 +243,10 @@ app.get('/api/reports/summary', async (req, res) => {
       }
     });
 
-    if (Array.isArray(level1Res.data) && level1Res.data.length > 0) {
-      rawRows = level1Res.data;
-    } else {
-      // Fallback to Level 0 if Level 1 has nothing
-      const level0Res = await axios.get(WIALON_URL, {
+    let rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
+
+    if (rawRows.length === 0) {
+      rowsRes = await axios.get(WIALON_URL, {
         params: {
           svc: 'report/select_result_rows',
           params: JSON.stringify({
@@ -182,48 +256,37 @@ app.get('/api/reports/summary', async (req, res) => {
           sid: eid
         }
       });
-      if (Array.isArray(level0Res.data)) {
-        rawRows = level0Res.data;
-      }
+      rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
     }
 
-    // Helper: Normalize header lookup
+    const headers = reportTables[0]?.header || [];
+
     const getColVal = (cols, keyword, fallback = "0.00") => {
-      const target = keyword.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const cleanTarget = keyword.toLowerCase().replace(/[^a-z0-9]/g, '');
       const idx = headers.findIndex(h => {
         const cleanH = (h || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-        return cleanH === target;
+        return cleanH === cleanTarget;
       });
-      return (idx !== -1 && cols[idx] !== undefined && cols[idx] !== null && cols[idx] !== "") ? cols[idx] : fallback;
+      return idx !== -1 && cols[idx] !== undefined && cols[idx] !== null && cols[idx] !== "" ? cols[idx] : fallback;
     };
 
-    const cleanRows = [];
-
-    for (const row of rawRows) {
+    const cleanRows = rawRows.map(row => {
       const cols = (row.c || []).map(c => (typeof c === 'object' ? c.t : c));
 
-      // Extract machine name from Grouping, row title (row.t), or first non-empty cell
-      let groupingVal = getColVal(cols, 'Grouping', '');
-      if (!groupingVal || groupingVal === "0.00") {
-        groupingVal = row.t || cols[1] || cols[0] || '';
-      }
+      const groupingVal = getColVal(cols, 'Grouping', '');
+      const machineName = groupingVal !== "" && groupingVal !== "0.00"
+        ? groupingVal
+        : (row.t || cols[1] || cols[0] || 'Unknown');
 
-      const rawName = String(groupingVal).trim();
-      
-      // Skip top-level total rows
-      if (!rawName || rawName.toLowerCase() === 'total' || rawName.toLowerCase() === 'totals') {
-        continue;
-      }
-
+      const rawName = String(machineName).trim();
       const normKey = rawName.toLowerCase().replace(/[^a-z0-9]/g, '');
 
-      // Resolve Unique ID from map or row attributes
-      const uniqueId = hardwareMap[rawName.toLowerCase()] 
-                    || hardwareMap[normKey] 
-                    || (row.i ? hardwareMap[String(row.i)] : null) 
+      const uniqueId = hardwareMap[rawName.toLowerCase()]
+                    || hardwareMap[normKey]
+                    || (row.i ? hardwareMap[String(row.i)] : null)
                     || (row.i ? Number(row.i) : null);
 
-      cleanRows.push({
+      return {
         "Machine GPS Unique ID": uniqueId,
         "Grouping": rawName,
         "Run KM": getColVal(cols, 'Run KM', '0.00 km'),
@@ -233,10 +296,9 @@ app.get('/api/reports/summary', async (req, res) => {
         "Fuel Consumed": getColVal(cols, 'Fuel Consumed', '0.00 l'),
         "Refulling": getColVal(cols, 'Refulling', '0.00 l'),
         "Parkings": getColVal(cols, 'Parkings', '0:00:00')
-      });
-    }
+      };
+    }).filter(r => r["Grouping"] !== 'Total' && r["Grouping"] !== 'Totals' && r["Grouping"] !== 'Unknown');
 
-    // Cleanup session memory
     await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
 
     res.json(cleanRows);
@@ -247,5 +309,5 @@ app.get('/api/reports/summary', async (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`API live on port ${PORT}`);
+  console.log(`Server listening on port ${PORT}`);
 });
