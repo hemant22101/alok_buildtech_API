@@ -22,7 +22,7 @@ let sessionId = null;
 let hardwareMapCache = null;
 let lastCacheTime = 0;
 
-// Session Management with automatic re-login recovery
+// Session Management
 async function getSession() {
   if (sessionId) return sessionId;
 
@@ -91,22 +91,6 @@ function getTodayISTInterval() {
   return { from, to };
 }
 
-// Recursive flattener for Wialon hierarchical tables (walks through row.r tree)
-function flattenRows(rowList) {
-  let flattened = [];
-  if (!Array.isArray(rowList)) return flattened;
-
-  for (const row of rowList) {
-    if (Array.isArray(row.c) && row.c.length > 0) {
-      flattened.push(row);
-    }
-    if (Array.isArray(row.r) && row.r.length > 0) {
-      flattened = flattened.concat(flattenRows(row.r));
-    }
-  }
-  return flattened;
-}
-
 app.get('/', (req, res) => {
   res.json({ status: 'online', service: 'Alok Buildtech Telematics & Fuel API' });
 });
@@ -167,64 +151,79 @@ app.get('/api/reports/summary', async (req, res) => {
       return res.json([]);
     }
 
-    // Pull rows with raw tree structure
-    const rowParams = {
-      tableIndex: 0,
-      config: { type: 'range', data: { from: 0, to: 1000, level: 0 } }
-    };
+    const headers = reportTables[0]?.header || [];
 
-    const rowsRes = await axios.get(WIALON_URL, {
-      params: { svc: 'report/select_result_rows', params: JSON.stringify(rowParams), sid: eid }
+    // CRUCIAL: Try Level 1 FIRST (where Detalization vehicle rows reside), then Level 0
+    let rawRows = [];
+    
+    // Attempt Level 1 (Child rows / Detalization items)
+    const level1Res = await axios.get(WIALON_URL, {
+      params: {
+        svc: 'report/select_result_rows',
+        params: JSON.stringify({
+          tableIndex: 0,
+          config: { type: 'range', data: { from: 0, to: 1000, level: 1 } }
+        }),
+        sid: eid
+      }
     });
 
-    // Flatten both root rows and child rows (row.r)
-    let allRows = flattenRows(Array.isArray(rowsRes.data) ? rowsRes.data : []);
-
-    // If level 0 returned no cells in any row, probe level 1 directly
-    if (allRows.length === 0) {
-      const subRowsRes = await axios.get(WIALON_URL, {
+    if (Array.isArray(level1Res.data) && level1Res.data.length > 0) {
+      rawRows = level1Res.data;
+    } else {
+      // Fallback to Level 0 if Level 1 has nothing
+      const level0Res = await axios.get(WIALON_URL, {
         params: {
           svc: 'report/select_result_rows',
           params: JSON.stringify({
             tableIndex: 0,
-            config: { type: 'range', data: { from: 0, to: 1000, level: 1 } }
+            config: { type: 'range', data: { from: 0, to: 1000, level: 0 } }
           }),
           sid: eid
         }
       });
-      allRows = flattenRows(Array.isArray(subRowsRes.data) ? subRowsRes.data : []);
+      if (Array.isArray(level0Res.data)) {
+        rawRows = level0Res.data;
+      }
     }
 
-    const headers = reportTables[0]?.header || [];
-
-    // Helper: Match column header value
+    // Helper: Normalize header lookup
     const getColVal = (cols, keyword, fallback = "0.00") => {
-      const cleanTarget = keyword.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const target = keyword.toLowerCase().replace(/[^a-z0-9]/g, '');
       const idx = headers.findIndex(h => {
-        const cleanHeader = (h || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-        return cleanHeader === cleanTarget;
+        const cleanH = (h || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        return cleanH === target;
       });
-      return idx !== -1 && cols[idx] !== undefined && cols[idx] !== null && cols[idx] !== "" ? cols[idx] : fallback;
+      return (idx !== -1 && cols[idx] !== undefined && cols[idx] !== null && cols[idx] !== "") ? cols[idx] : fallback;
     };
 
-    const cleanRows = allRows.map(row => {
+    const cleanRows = [];
+
+    for (const row of rawRows) {
       const cols = (row.c || []).map(c => (typeof c === 'object' ? c.t : c));
 
-      // Extract machine name from 'Grouping' or row title
-      const groupingVal = getColVal(cols, 'Grouping', '');
-      const machineName = groupingVal !== "" && groupingVal !== "0.00" 
-        ? groupingVal 
-        : (row.t || cols[1] || cols[0] || 'Unknown');
+      // Extract machine name from Grouping, row title (row.t), or first non-empty cell
+      let groupingVal = getColVal(cols, 'Grouping', '');
+      if (!groupingVal || groupingVal === "0.00") {
+        groupingVal = row.t || cols[1] || cols[0] || '';
+      }
+
+      const rawName = String(groupingVal).trim();
       
-      const rawName = String(machineName).trim();
+      // Skip top-level total rows
+      if (!rawName || rawName.toLowerCase() === 'total' || rawName.toLowerCase() === 'totals') {
+        continue;
+      }
+
       const normKey = rawName.toLowerCase().replace(/[^a-z0-9]/g, '');
 
+      // Resolve Unique ID from map or row attributes
       const uniqueId = hardwareMap[rawName.toLowerCase()] 
                     || hardwareMap[normKey] 
                     || (row.i ? hardwareMap[String(row.i)] : null) 
                     || (row.i ? Number(row.i) : null);
 
-      return {
+      cleanRows.push({
         "Machine GPS Unique ID": uniqueId,
         "Grouping": rawName,
         "Run KM": getColVal(cols, 'Run KM', '0.00 km'),
@@ -234,9 +233,10 @@ app.get('/api/reports/summary', async (req, res) => {
         "Fuel Consumed": getColVal(cols, 'Fuel Consumed', '0.00 l'),
         "Refulling": getColVal(cols, 'Refulling', '0.00 l'),
         "Parkings": getColVal(cols, 'Parkings', '0:00:00')
-      };
-    }).filter(r => r["Grouping"] !== 'Total' && r["Grouping"] !== 'Unknown'); // Exclude total summary row
+      });
+    }
 
+    // Cleanup session memory
     await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
 
     res.json(cleanRows);
