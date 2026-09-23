@@ -18,16 +18,18 @@ const DEFAULT_RESOURCE_ID = 26688401;
 const DEFAULT_TEMPLATE_ID = 1;
 const DEFAULT_OBJECT_ID   = 28314498;
 
-let sessionId = null;
+let activeSessionId = null;
 let hardwareMapCache = null;
 let lastCacheTime = 0;
 
-// Session Management with automatic re-login recovery
-async function getSession() {
-  if (sessionId) return sessionId;
+// Automatic Session Login with Re-Authentication
+async function getSession(forceRefresh = false) {
+  if (activeSessionId && !forceRefresh) {
+    return activeSessionId;
+  }
 
   if (!TOKEN) {
-    throw new Error('Missing WIALON_TOKEN environment variable.');
+    throw new Error('Missing WIALON_TOKEN environment variable in Render.');
   }
 
   const response = await axios.get(WIALON_URL, {
@@ -38,12 +40,30 @@ async function getSession() {
     throw new Error(`Wialon login failed with error code: ${response.data.error}`);
   }
 
-  sessionId = response.data.eid;
-  return sessionId;
+  activeSessionId = response.data.eid;
+  return activeSessionId;
+}
+
+// Wrapper to auto-retry calls if Wialon returns {"error": 1}
+async function executeWialonRequest(svc, params) {
+  let sid = await getSession();
+  let res = await axios.get(WIALON_URL, {
+    params: { svc, params: JSON.stringify(params), sid }
+  });
+
+  if (res.data && res.data.error === 1) {
+    // Force new session login and retry
+    sid = await getSession(true);
+    res = await axios.get(WIALON_URL, {
+      params: { svc, params: JSON.stringify(params), sid }
+    });
+  }
+
+  return res.data;
 }
 
 // Hardware & Unit ID Mapping
-async function getUnitHardwareMap(eid) {
+async function getUnitHardwareMap() {
   const now = Date.now();
   if (hardwareMapCache && (now - lastCacheTime < 15 * 60 * 1000)) {
     return hardwareMapCache;
@@ -57,12 +77,10 @@ async function getUnitHardwareMap(eid) {
     to: 0
   };
 
-  const res = await axios.get(WIALON_URL, {
-    params: { svc: 'core/search_items', params: JSON.stringify(searchParams), sid: eid }
-  });
+  const data = await executeWialonRequest('core/search_items', searchParams);
 
   const map = {};
-  (res.data.items || []).forEach(unit => {
+  (data.items || []).forEach(unit => {
     const identifier = unit.uid || (unit.net ? unit.net.uid : null) || unit.id;
 
     if (unit.nm) {
@@ -91,93 +109,24 @@ function getTodayISTInterval() {
   return { from, to };
 }
 
-// Root Health Check
+// Recursive row collector for Detalization tree
+function collectAllRows(items) {
+  let result = [];
+  if (!Array.isArray(items)) return result;
+
+  for (const item of items) {
+    if (item.c && Array.isArray(item.c) && item.c.length > 0) {
+      result.push(item);
+    }
+    if (item.r && Array.isArray(item.r) && item.r.length > 0) {
+      result = result.concat(collectAllRows(item.r));
+    }
+  }
+  return result;
+}
+
 app.get('/', (req, res) => {
   res.json({ status: 'online', service: 'Alok Buildtech Telematics & Fuel API' });
-});
-
-// Diagnostic Inspection Endpoint
-app.get('/api/raw-diagnostic', async (req, res) => {
-  try {
-    let eid = await getSession();
-
-    const from = parseInt(req.query.from) || getTodayISTInterval().from;
-    const to   = parseInt(req.query.to)   || getTodayISTInterval().to;
-
-    const execParams = {
-      reportResourceId: DEFAULT_RESOURCE_ID,
-      reportTemplateId: DEFAULT_TEMPLATE_ID,
-      reportTemplate: null,
-      reportObjectId: DEFAULT_OBJECT_ID,
-      reportObjectSecId: 0,
-      interval: { flags: 16777216, from, to },
-      remoteExec: 1,
-      reportObjectIdList: []
-    };
-
-    let execRes = await axios.get(WIALON_URL, {
-      params: { svc: 'report/exec_report', params: JSON.stringify(execParams), sid: eid }
-    });
-
-    if (execRes.data.error === 1) {
-      sessionId = null;
-      eid = await getSession();
-      execRes = await axios.get(WIALON_URL, {
-        params: { svc: 'report/exec_report', params: JSON.stringify(execParams), sid: eid }
-      });
-    }
-
-    if (execRes.data.error) {
-      return res.status(400).json({ error: `Wialon exec_report error: ${execRes.data.error}` });
-    }
-
-    const reportResult = execRes.data.reportResult;
-    if (!reportResult || !reportResult.tables || reportResult.tables.length === 0) {
-      return res.json({ error: 'No report tables generated', rawReportResult: reportResult });
-    }
-
-    const tablesSummary = [];
-    const tableSamples = {};
-
-    for (let tIdx = 0; tIdx < reportResult.tables.length; tIdx++) {
-      const tMeta = reportResult.tables[tIdx];
-      tablesSummary.push({
-        index: tIdx,
-        name: tMeta.name,
-        label: tMeta.label,
-        rowsReported: tMeta.rows,
-        headers: tMeta.header
-      });
-
-      tableSamples[`table_${tIdx}`] = {};
-
-      for (const lvl of [0, 1]) {
-        const rowsRes = await axios.get(WIALON_URL, {
-          params: {
-            svc: 'report/select_result_rows',
-            params: JSON.stringify({
-              tableIndex: tIdx,
-              config: { type: 'range', data: { from: 0, to: 5, level: lvl } }
-            }),
-            sid: eid
-          }
-        });
-        tableSamples[`table_${tIdx}`][`level_${lvl}`] = rowsRes.data;
-      }
-    }
-
-    await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
-
-    res.json({
-      status: 'success',
-      interval: { from, to },
-      tablesSummary,
-      tableSamples
-    });
-
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
 });
 
 // Primary Summary Endpoint
@@ -196,9 +145,9 @@ app.get('/api/reports/summary', async (req, res) => {
   const to   = parseInt(req.query.to)   || defaultInterval.to;
 
   try {
-    let eid = await getSession();
-    const hardwareMap = await getUnitHardwareMap(eid);
+    const hardwareMap = await getUnitHardwareMap();
 
+    // 1. Run report
     const execParams = {
       reportResourceId: resourceId,
       reportTemplateId: templateId,
@@ -210,75 +159,65 @@ app.get('/api/reports/summary', async (req, res) => {
       reportObjectIdList: []
     };
 
-    let execRes = await axios.get(WIALON_URL, {
-      params: { svc: 'report/exec_report', params: JSON.stringify(execParams), sid: eid }
-    });
+    const execRes = await executeWialonRequest('report/exec_report', execParams);
 
-    if (execRes.data.error === 1) {
-      sessionId = null;
-      eid = await getSession();
-      execRes = await axios.get(WIALON_URL, {
-        params: { svc: 'report/exec_report', params: JSON.stringify(execParams), sid: eid }
-      });
+    if (execRes.error) {
+      return res.status(400).json({ error: `Wialon exec_report error: ${execRes.error}` });
     }
 
-    if (execRes.data.error) {
-      return res.status(400).json({ error: `Wialon report error code: ${execRes.data.error}` });
-    }
-
-    const reportTables = execRes.data.reportResult?.tables || [];
-    if (reportTables.length === 0) {
-      await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
+    const reportTables = execRes.reportResult?.tables || [];
+    if (reportTables.length === 0 || reportTables[0].rows === 0) {
+      await executeWialonRequest('report/cleanup_result', {});
       return res.json([]);
-    }
-
-    let rowsRes = await axios.get(WIALON_URL, {
-      params: {
-        svc: 'report/select_result_rows',
-        params: JSON.stringify({
-          tableIndex: 0,
-          config: { type: 'range', data: { from: 0, to: 1000, level: 1 } }
-        }),
-        sid: eid
-      }
-    });
-
-    let rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
-
-    if (rawRows.length === 0) {
-      rowsRes = await axios.get(WIALON_URL, {
-        params: {
-          svc: 'report/select_result_rows',
-          params: JSON.stringify({
-            tableIndex: 0,
-            config: { type: 'range', data: { from: 0, to: 1000, level: 0 } }
-          }),
-          sid: eid
-        }
-      });
-      rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
     }
 
     const headers = reportTables[0]?.header || [];
 
+    // 2. Extract Rows (level: 0 with all child rows flattened)
+    const rowsRes = await executeWialonRequest('report/select_result_rows', {
+      tableIndex: 0,
+      config: { type: 'range', data: { from: 0, to: 500, level: 0 } }
+    });
+
+    let rawList = Array.isArray(rowsRes) ? rowsRes : [];
+    let flattened = collectAllRows(rawList);
+
+    // Fallback to level: 1 if level 0 contained no rows with cells
+    if (flattened.length === 0) {
+      const subRowsRes = await executeWialonRequest('report/select_result_rows', {
+        tableIndex: 0,
+        config: { type: 'range', data: { from: 0, to: 500, level: 1 } }
+      });
+      flattened = collectAllRows(Array.isArray(subRowsRes) ? subRowsRes : []);
+    }
+
+    // Helper: Normalize header lookup
     const getColVal = (cols, keyword, fallback = "0.00") => {
-      const cleanTarget = keyword.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const target = keyword.toLowerCase().replace(/[^a-z0-9]/g, '');
       const idx = headers.findIndex(h => {
         const cleanH = (h || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-        return cleanH === cleanTarget;
+        return cleanH === target;
       });
-      return idx !== -1 && cols[idx] !== undefined && cols[idx] !== null && cols[idx] !== "" ? cols[idx] : fallback;
+      return (idx !== -1 && cols[idx] !== undefined && cols[idx] !== null && cols[idx] !== "") ? cols[idx] : fallback;
     };
 
-    const cleanRows = rawRows.map(row => {
-      const cols = (row.c || []).map(c => (typeof c === 'object' ? c.t : c));
+    const cleanRows = [];
 
-      const groupingVal = getColVal(cols, 'Grouping', '');
-      const machineName = groupingVal !== "" && groupingVal !== "0.00"
-        ? groupingVal
-        : (row.t || cols[1] || cols[0] || 'Unknown');
+    for (const row of flattened) {
+      const cols = (row.c || []).map(c => (typeof c === 'object' && c !== null ? (c.t !== undefined ? c.t : '') : String(c || '')));
 
-      const rawName = String(machineName).trim();
+      let groupingVal = getColVal(cols, 'Grouping', '');
+      if (!groupingVal || groupingVal === "0.00") {
+        groupingVal = row.t || cols[1] || cols[0] || '';
+      }
+
+      const rawName = String(groupingVal).trim();
+
+      // Filter summary rows
+      if (!rawName || rawName.toLowerCase() === 'total' || rawName.toLowerCase() === 'totals') {
+        continue;
+      }
+
       const normKey = rawName.toLowerCase().replace(/[^a-z0-9]/g, '');
 
       const uniqueId = hardwareMap[rawName.toLowerCase()]
@@ -286,7 +225,7 @@ app.get('/api/reports/summary', async (req, res) => {
                     || (row.i ? hardwareMap[String(row.i)] : null)
                     || (row.i ? Number(row.i) : null);
 
-      return {
+      cleanRows.push({
         "Machine GPS Unique ID": uniqueId,
         "Grouping": rawName,
         "Run KM": getColVal(cols, 'Run KM', '0.00 km'),
@@ -296,10 +235,10 @@ app.get('/api/reports/summary', async (req, res) => {
         "Fuel Consumed": getColVal(cols, 'Fuel Consumed', '0.00 l'),
         "Refulling": getColVal(cols, 'Refulling', '0.00 l'),
         "Parkings": getColVal(cols, 'Parkings', '0:00:00')
-      };
-    }).filter(r => r["Grouping"] !== 'Total' && r["Grouping"] !== 'Totals' && r["Grouping"] !== 'Unknown');
+      });
+    }
 
-    await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
+    await executeWialonRequest('report/cleanup_result', {});
 
     res.json(cleanRows);
 
@@ -309,5 +248,5 @@ app.get('/api/reports/summary', async (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log(`API live on port ${PORT}`);
 });
