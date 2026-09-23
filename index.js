@@ -11,7 +11,6 @@ app.use(express.json({ limit: '10mb' }));
 const PORT = process.env.PORT || 10000;
 const WIALON_URL = 'https://hst-api.wialon.com/wialon/ajax.html';
 
-// Account credentials & targets
 const TOKEN = process.env.WIALON_TOKEN;
 const CLIENT_API_KEY = process.env.CLIENT_API_KEY || 'alok_buidtech_abpl@9000';
 
@@ -23,7 +22,7 @@ let sessionId = null;
 let unitsCatalogCache = null;
 let lastCacheTime = 0;
 
-// Session Management with automatic re-login
+// Session Management with automatic re-login recovery
 async function getSession() {
   if (sessionId) return sessionId;
 
@@ -43,14 +42,14 @@ async function getSession() {
   return sessionId;
 }
 
-// Unit Catalog: Retrieves Unit Details, Hardware IMEI / Unit ID, and Fuel Sensor configuration
+// Unit Catalog: Extracts ID, Fuel Sensor Config, and Last Known Sensor Values
 async function getUnitsCatalog(eid) {
   const now = Date.now();
   if (unitsCatalogCache && (now - lastCacheTime < 15 * 60 * 1000)) {
     return unitsCatalogCache;
   }
 
-  // Flag 4097 = 1 (base info: id, nm) + 4096 (sensors configuration)
+  // Flags: 1 (base) + 4096 (sensors) = 4097
   const searchParams = {
     spec: { itemsType: 'avl_unit', propName: 'sys_name', propValueMask: '*', sortType: 'sys_name' },
     force: 1,
@@ -73,7 +72,7 @@ async function getUnitsCatalog(eid) {
   (res.data.items || []).forEach(unit => {
     const identifier = unit.uid || (unit.net ? unit.net.uid : null) || unit.id;
     
-    // Find fuel level sensor ID if present
+    // Locate Fuel Level Sensor (ID 4 in your unit configuration)
     let fuelSensorId = null;
     if (unit.sens) {
       for (const sId in unit.sens) {
@@ -109,7 +108,7 @@ async function getUnitsCatalog(eid) {
   return catalog;
 }
 
-// Fetches the last known fuel volume for an idle/parked machine
+// Fetch last known fuel level via calc_last_message or last message sensor value
 async function getLastKnownFuelLevel(unitId, sensorId, eid) {
   if (!sensorId) return "0.00 l";
   try {
@@ -121,16 +120,31 @@ async function getLastKnownFuelLevel(unitId, sensorId, eid) {
       }
     });
 
-    if (res.data && typeof res.data.result === 'number') {
+    if (res.data && typeof res.data.result === 'number' && res.data.result > 0) {
       return `${res.data.result.toFixed(2)} l`;
     }
+
+    // Fallback: Check last message parameters directly
+    const msgRes = await axios.get(WIALON_URL, {
+      params: {
+        svc: 'messages/load_last',
+        params: JSON.stringify({ itemId: unitId, lastTime: Math.floor(Date.now() / 1000), lastCount: 1, flags: 0, flagsMask: 0, loadCount: 1 }),
+        sid: eid
+      }
+    });
+
+    const lastMsg = msgRes.data?.messages?.[0];
+    if (lastMsg && lastMsg.p && lastMsg.p.fuel_lvl !== undefined) {
+      return `${Number(lastMsg.p.fuel_lvl).toFixed(2)} l`;
+    }
+
     return "0.00 l";
   } catch {
     return "0.00 l";
   }
 }
 
-// IST dynamic "Today" timeframe helper (UTC+5:30)
+// Helper: dynamic today interval (00:00:00 IST to current timestamp)
 function getTodayISTInterval() {
   const now = new Date();
   const istOffsetMs = 5.5 * 60 * 60 * 1000;
@@ -146,7 +160,7 @@ app.get('/', (req, res) => {
   res.json({ status: 'online', service: 'Alok Buildtech Telematics & Fuel API' });
 });
 
-// Summary Endpoint with Zero-Activity Fallback
+// Summary Endpoint with Parking Time and Fuel Fallback
 app.get('/api/reports/summary', async (req, res) => {
   const key = req.headers['x-api-key'] || req.query.apiKey;
   if (key !== CLIENT_API_KEY) {
@@ -171,11 +185,7 @@ app.get('/api/reports/summary', async (req, res) => {
       reportTemplate: null,
       reportObjectId: objectId,
       reportObjectSecId: 0,
-      interval: {
-        flags: 16777216,
-        from: from,
-        to: to
-      },
+      interval: { flags: 16777216, from, to },
       remoteExec: 1,
       reportObjectIdList: []
     };
@@ -213,19 +223,26 @@ app.get('/api/reports/summary', async (req, res) => {
       rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
     }
 
-    const getColVal = (cols, keyword) => {
-      const idx = headers.findIndex(h => (h || '').toLowerCase().trim() === keyword.toLowerCase().trim());
-      return idx !== -1 && cols[idx] !== undefined ? cols[idx] : "0.00";
+    // Helper: Match column header value flexibly across possible aliases
+    const getColVal = (cols, keywords, defaultVal = "0.00") => {
+      const keywordList = Array.isArray(keywords) ? keywords : [keywords];
+      for (const kw of keywordList) {
+        const idx = headers.findIndex(h => (h || '').toLowerCase().trim().includes(kw.toLowerCase().trim()));
+        if (idx !== -1 && cols[idx] !== undefined && cols[idx] !== null && cols[idx] !== "") {
+          return cols[idx];
+        }
+      }
+      return defaultVal;
     };
 
     const cleanRows = [];
     const reportedUnitNames = new Set();
 
-    // 1. Process active vehicles present in the report
-    rawRows.forEach(row => {
+    // 1. Process active units that appeared in report table
+    for (const row of rawRows) {
       const cols = (row.c || []).map(c => (typeof c === 'object' ? c.t : c));
 
-      const groupingVal = getColVal(cols, 'Grouping');
+      const groupingVal = getColVal(cols, ['Grouping', 'Unit', 'Object']);
       const machineName = groupingVal !== "0.00" ? groupingVal : (row.t || cols[1] || cols[0] || 'Unknown');
       const rawName = String(machineName).trim();
       const normKey = rawName.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -238,23 +255,32 @@ app.get('/api/reports/summary', async (req, res) => {
 
       const uniqueId = unitMatch?.uniqueId || (row.i ? Number(row.i) : null);
 
+      // Extract parking or stay duration from report columns
+      let parkingTime = getColVal(cols, ['Parking', 'Parkings', 'Stay time', 'Stops duration'], null);
+      const timeRun = getColVal(cols, ['Time Run', 'Engine hours', 'Move time'], '0:00:00');
+
+      // If parking wasn't explicitly added to template but unit ran 0 time, parking = 24h
+      if (!parkingTime) {
+        parkingTime = timeRun === "0:00:00" ? "24:00:00" : "0:00:00";
+      }
+
       cleanRows.push({
         "Machine GPS Unique ID": uniqueId,
         "Grouping": rawName,
-        "Run KM": getColVal(cols, 'Run KM'),
-        "Time Run": getColVal(cols, 'Time Run'),
-        "Fuel Opening": getColVal(cols, 'Fuel Opening'),
-        "Fuel Closing": getColVal(cols, 'Fuel Closing'),
-        "Fuel Consumed": getColVal(cols, 'Fuel consumed'),
-        "Refuelling": getColVal(cols, 'Refulling')
+        "Run KM": getColVal(cols, ['Run KM', 'Mileage'], '0.00 km'),
+        "Time Run": timeRun,
+        "Parking Time": parkingTime,
+        "Fuel Opening": getColVal(cols, ['Fuel Opening', 'Initial fuel'], '0.00 l'),
+        "Fuel Closing": getColVal(cols, ['Fuel Closing', 'Final fuel'], '0.00 l'),
+        "Fuel Consumed": getColVal(cols, ['Fuel consumed', 'Consumed'], '0.00 l'),
+        "Refuelling": getColVal(cols, ['Refulling', 'Filled'], '0.00 l')
       });
-    });
+    }
 
-    // 2. Zero-activity fallback: populate units that had no movements during the date range
+    // 2. Process stationary/parked units not present in report rows
     for (const unit of catalog.allUnits) {
       const normKey = unit.name.toLowerCase().replace(/[^a-z0-9]/g, '');
 
-      // If unit was not in report results, calculate last known fuel level
       if (!reportedUnitNames.has(normKey)) {
         const lastFuel = await getLastKnownFuelLevel(unit.id, unit.fuelSensorId, eid);
 
@@ -263,6 +289,7 @@ app.get('/api/reports/summary', async (req, res) => {
           "Grouping": unit.name,
           "Run KM": "0.00 km",
           "Time Run": "0:00:00",
+          "Parking Time": "24:00:00",
           "Fuel Opening": lastFuel,
           "Fuel Closing": lastFuel,
           "Fuel Consumed": "0.00 l",
