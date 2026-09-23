@@ -81,7 +81,7 @@ async function getUnitHardwareMap(eid) {
   return map;
 }
 
-// Default IST dynamic interval (00:00:00 IST to current second)
+// Default IST dynamic interval (00:00:00 IST to current timestamp)
 function getTodayISTInterval() {
   const now = new Date();
   const istOffsetMs = 5.5 * 60 * 60 * 1000;
@@ -97,7 +97,7 @@ app.get('/', (req, res) => {
   res.json({ status: 'online', service: 'Alok Buildtech Telematics & Fuel API' });
 });
 
-// Summary Endpoint
+// Summary Endpoint with Multi-Level Hierarchy Inspection
 app.get('/api/reports/summary', async (req, res) => {
   const key = req.headers['x-api-key'] || req.query.apiKey;
   if (key !== CLIENT_API_KEY) {
@@ -108,7 +108,7 @@ app.get('/api/reports/summary', async (req, res) => {
   const templateId = parseInt(req.query.templateId) || DEFAULT_TEMPLATE_ID;
   const objectId   = parseInt(req.query.objectId)   || DEFAULT_OBJECT_ID;
 
-  // Use passed interval or default to dynamic Today IST
+  // Use provided timestamp range or fall back to dynamic Today IST
   const defaultInterval = getTodayISTInterval();
   const from = parseInt(req.query.from) || defaultInterval.from;
   const to   = parseInt(req.query.to)   || defaultInterval.to;
@@ -117,7 +117,7 @@ app.get('/api/reports/summary', async (req, res) => {
     let eid = await getSession();
     const hardwareMap = await getUnitHardwareMap(eid);
 
-    // Exact execution payload matching template 1 parameters
+    // Exact execution parameters matching your template specification
     const execParams = {
       reportResourceId: resourceId,
       reportTemplateId: templateId,
@@ -137,7 +137,7 @@ app.get('/api/reports/summary', async (req, res) => {
       params: { svc: 'report/exec_report', params: JSON.stringify(execParams), sid: eid }
     });
 
-    // Auto-recovery if session expired
+    // Handle session expiration
     if (execRes.data.error === 1) {
       sessionId = null;
       eid = await getSession();
@@ -147,7 +147,7 @@ app.get('/api/reports/summary', async (req, res) => {
     }
 
     if (execRes.data.error) {
-      return res.status(400).json({ error: `Wialon report execution error code: ${execRes.data.error}` });
+      return res.status(400).json({ error: `Wialon report execution error: ${execRes.data.error}` });
     }
 
     const reportTables = execRes.data.reportResult?.tables || [];
@@ -156,25 +156,36 @@ app.get('/api/reports/summary', async (req, res) => {
       return res.json([]);
     }
 
-    // Step 1: Query level 1 (sub-rows inside unit grouping)
-    let rowParams = {
-      tableIndex: 0,
-      config: { type: 'range', data: { from: 0, to: 1000, level: 1 } }
-    };
-
+    // Step 1: Probe level 0 rows (Standard / Parent Group)
     let rowsRes = await axios.get(WIALON_URL, {
-      params: { svc: 'report/select_result_rows', params: JSON.stringify(rowParams), sid: eid }
+      params: {
+        svc: 'report/select_result_rows',
+        params: JSON.stringify({
+          tableIndex: 0,
+          config: { type: 'range', data: { from: 0, to: 1000, level: 0 } }
+        }),
+        sid: eid
+      }
     });
 
     let rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
 
-    // Step 2: Fallback to level 0 if level 1 returned empty
-    if (rawRows.length === 0) {
-      rowParams.config.data.level = 0;
-      rowsRes = await axios.get(WIALON_URL, {
-        params: { svc: 'report/select_result_rows', params: JSON.stringify(rowParams), sid: eid }
+    // Step 2: Fall back to level 1 if level 0 contains no usable row cells
+    const hasDataCells = rawRows.some(r => Array.isArray(r.c) && r.c.length > 0);
+    if (!hasDataCells) {
+      const subRowsRes = await axios.get(WIALON_URL, {
+        params: {
+          svc: 'report/select_result_rows',
+          params: JSON.stringify({
+            tableIndex: 0,
+            config: { type: 'range', data: { from: 0, to: 1000, level: 1 } }
+          }),
+          sid: eid
+        }
       });
-      rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
+      if (Array.isArray(subRowsRes.data) && subRowsRes.data.length > 0) {
+        rawRows = subRowsRes.data;
+      }
     }
 
     const headers = reportTables[0]?.header || [];
@@ -192,7 +203,7 @@ app.get('/api/reports/summary', async (req, res) => {
       const rawName = String(machineName).trim();
       const normKey = rawName.toLowerCase().replace(/[^a-z0-9]/g, '');
 
-      // Resolve Unique ID: exact name -> stripped key -> row unit id -> number fallback
+      // Resolve Unique ID: exact key -> stripped key -> row unit id (row.i)
       const uniqueId = hardwareMap[rawName.toLowerCase()] 
                     || hardwareMap[normKey] 
                     || (row.i ? hardwareMap[String(row.i)] : null) 
@@ -211,7 +222,7 @@ app.get('/api/reports/summary', async (req, res) => {
       };
     });
 
-    // Free report memory on Wialon server
+    // Cleanup session report memory on Wialon
     await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
 
     res.json(cleanRows);
@@ -221,6 +232,56 @@ app.get('/api/reports/summary', async (req, res) => {
   }
 });
 
+// Diagnostic Inspection Endpoint: Returns raw Wialon structure to debug empty returns
+app.get('/api/debug-report', async (req, res) => {
+  try {
+    let eid = await getSession();
+    const from = parseInt(req.query.from) || 1790101800;
+    const to   = parseInt(req.query.to)   || 1790188199;
+
+    const execRes = await axios.get(WIALON_URL, {
+      params: {
+        svc: 'report/exec_report',
+        params: JSON.stringify({
+          reportResourceId: DEFAULT_RESOURCE_ID,
+          reportTemplateId: DEFAULT_TEMPLATE_ID,
+          reportTemplate: null,
+          reportObjectId: DEFAULT_OBJECT_ID,
+          reportObjectSecId: 0,
+          interval: { flags: 16777216, from, to },
+          remoteExec: 1,
+          reportObjectIdList: []
+        }),
+        sid: eid
+      }
+    });
+
+    const tables = execRes.data.reportResult?.tables || [];
+    if (!tables.length) {
+      return res.json({ message: "No tables generated", reportResult: execRes.data.reportResult });
+    }
+
+    const rowsRes = await axios.get(WIALON_URL, {
+      params: {
+        svc: 'report/select_result_rows',
+        params: JSON.stringify({
+          tableIndex: 0,
+          config: { type: 'range', data: { from: 0, to: 10, level: 0 } }
+        }),
+        sid: eid
+      }
+    });
+
+    res.json({
+      tableMetadata: tables[0],
+      totalRowsReported: tables[0].rows,
+      rawRowsSample: rowsRes.data
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
