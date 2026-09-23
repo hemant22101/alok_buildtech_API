@@ -12,20 +12,19 @@ const PORT = process.env.PORT || 10000;
 const WIALON_URL = 'https://hst-api.wialon.com/wialon/ajax.html';
 
 // Account credentials & target defaults
-const TOKEN = process.env.WIALON_TOKEN || '38d7318f04f9084e413bb027d54e43d5FBB4EE33A40D6819959DC2E9BFCE80A3027A6205';
+const TOKEN = process.env.WIALON_TOKEN;
 const CLIENT_API_KEY = process.env.CLIENT_API_KEY || 'alok_buidtech_abpl@9000';
 
-// Updated Wialon Target IDs
+// Updated Default IDs
 const DEFAULT_RESOURCE_ID = 28310909;
 const DEFAULT_TEMPLATE_ID = 12;
 const DEFAULT_OBJECT_ID   = 28378146;
 
-// Seeded with your active session; auto-recovers if expired
-let sessionId = '04b3457c9f43f8635fe7b97ba2957358';
+let sessionId = null;
 let hardwareMapCache = null;
 let lastCacheTime = 0;
 
-// Session Management with automatic recovery
+// Session Management with auto-relogin
 async function getSession() {
   if (sessionId) return sessionId;
 
@@ -45,7 +44,7 @@ async function getSession() {
   return sessionId;
 }
 
-// Hardware & Unit ID Map (Priority: Physical IMEI -> Wialon Unit ID)
+// Hardware & Unit ID Map: Resolves vehicle name to physical IMEI (uid) or Wialon Unit ID (id)
 async function getUnitHardwareMap(eid) {
   const now = Date.now();
   if (hardwareMapCache && (now - lastCacheTime < 15 * 60 * 1000)) {
@@ -83,7 +82,7 @@ async function getUnitHardwareMap(eid) {
   return map;
 }
 
-// Dynamic IST timeframe helper (00:00:00 IST to current second)
+// Dynamic IST timeframe helper (00:00:00 IST to current timestamp)
 function getTodayISTInterval() {
   const now = new Date();
   const istOffsetMs = 5.5 * 60 * 60 * 1000;
@@ -94,12 +93,12 @@ function getTodayISTInterval() {
   return { from, to };
 }
 
-// Root Health Check
+// Health Check
 app.get('/', (req, res) => {
-  res.json({ status: 'online', service: 'Operational Fleet API' });
+  res.json({ status: 'online', service: 'Alok Buildtech Telematics & Fuel API' });
 });
 
-// Clean Summary Report Endpoint
+// Summary Report Endpoint
 app.get('/api/reports/summary', async (req, res) => {
   const key = req.headers['x-api-key'] || req.query.apiKey;
   if (key !== CLIENT_API_KEY) {
@@ -125,8 +124,7 @@ app.get('/api/reports/summary', async (req, res) => {
       reportObjectId: objectId,
       reportObjectSecId: 0,
       reportObjectIdList: [],
-      interval: { from, to, flags: 16777216 },
-      remoteExec: 1
+      interval: { from, to, flags: 16777216 }
     };
 
     let execRes = await axios.get(WIALON_URL, {
@@ -151,7 +149,7 @@ app.get('/api/reports/summary', async (req, res) => {
       return res.json([]);
     }
 
-    // 2. Select rows from Table 0
+    // 2. Extract rows from Table 0
     const rowParams = {
       tableIndex: 0,
       config: { type: 'range', data: { from: 0, to: 1000, level: 0 } }
@@ -170,7 +168,7 @@ app.get('/api/reports/summary', async (req, res) => {
       return idx !== -1 && cols[idx] !== undefined ? cols[idx] : "0.00";
     };
 
-    // 3. Map clean data rows matching the Wialon report columns
+    // 3. Map exact columns matching the Wialon report view
     const cleanRows = rawRows.map(row => {
       const cols = (row.c || []).map(c => (typeof c === 'object' ? c.t : c));
 
@@ -197,7 +195,7 @@ app.get('/api/reports/summary', async (req, res) => {
       };
     });
 
-    // 4. Release report execution memory
+    // 4. Release server report memory
     await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
 
     res.json(cleanRows);
