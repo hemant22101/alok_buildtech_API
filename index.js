@@ -80,7 +80,7 @@ async function getUnitHardwareMap(eid) {
   return map;
 }
 
-// Default IST dynamic interval (00:00:00 IST to current timestamp)
+// Helper: dynamic today interval (00:00:00 IST to current timestamp)
 function getTodayISTInterval() {
   const now = new Date();
   const istOffsetMs = 5.5 * 60 * 60 * 1000;
@@ -89,6 +89,22 @@ function getTodayISTInterval() {
   const from = Math.floor((istMidnight.getTime() - istOffsetMs) / 1000);
   const to = Math.floor(Date.now() / 1000);
   return { from, to };
+}
+
+// Recursive flattener for Wialon hierarchical tables (walks through row.r tree)
+function flattenRows(rowList) {
+  let flattened = [];
+  if (!Array.isArray(rowList)) return flattened;
+
+  for (const row of rowList) {
+    if (Array.isArray(row.c) && row.c.length > 0) {
+      flattened.push(row);
+    }
+    if (Array.isArray(row.r) && row.r.length > 0) {
+      flattened = flattened.concat(flattenRows(row.r));
+    }
+  }
+  return flattened;
 }
 
 app.get('/', (req, res) => {
@@ -146,28 +162,26 @@ app.get('/api/reports/summary', async (req, res) => {
     }
 
     const reportTables = execRes.data.reportResult?.tables || [];
-    if (reportTables.length === 0 || reportTables[0].rows === 0) {
+    if (reportTables.length === 0) {
       await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
       return res.json([]);
     }
 
-    // Step 1: Probe level 0 rows
-    let rowsRes = await axios.get(WIALON_URL, {
-      params: {
-        svc: 'report/select_result_rows',
-        params: JSON.stringify({
-          tableIndex: 0,
-          config: { type: 'range', data: { from: 0, to: 1000, level: 0 } }
-        }),
-        sid: eid
-      }
+    // Pull rows with raw tree structure
+    const rowParams = {
+      tableIndex: 0,
+      config: { type: 'range', data: { from: 0, to: 1000, level: 0 } }
+    };
+
+    const rowsRes = await axios.get(WIALON_URL, {
+      params: { svc: 'report/select_result_rows', params: JSON.stringify(rowParams), sid: eid }
     });
 
-    let rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
+    // Flatten both root rows and child rows (row.r)
+    let allRows = flattenRows(Array.isArray(rowsRes.data) ? rowsRes.data : []);
 
-    // Step 2: If level 0 rows have no cells, or if there is deeper detalization, fetch level 1
-    const hasDataCells = rawRows.some(r => Array.isArray(r.c) && r.c.length > 0);
-    if (!hasDataCells || rawRows.length === 0) {
+    // If level 0 returned no cells in any row, probe level 1 directly
+    if (allRows.length === 0) {
       const subRowsRes = await axios.get(WIALON_URL, {
         params: {
           svc: 'report/select_result_rows',
@@ -178,24 +192,30 @@ app.get('/api/reports/summary', async (req, res) => {
           sid: eid
         }
       });
-      if (Array.isArray(subRowsRes.data) && subRowsRes.data.length > 0) {
-        rawRows = subRowsRes.data;
-      }
+      allRows = flattenRows(Array.isArray(subRowsRes.data) ? subRowsRes.data : []);
     }
 
     const headers = reportTables[0]?.header || [];
 
-    // Flexible column matcher
+    // Helper: Match column header value
     const getColVal = (cols, keyword, fallback = "0.00") => {
-      const idx = headers.findIndex(h => (h || '').toLowerCase().trim() === keyword.toLowerCase().trim());
+      const cleanTarget = keyword.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const idx = headers.findIndex(h => {
+        const cleanHeader = (h || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        return cleanHeader === cleanTarget;
+      });
       return idx !== -1 && cols[idx] !== undefined && cols[idx] !== null && cols[idx] !== "" ? cols[idx] : fallback;
     };
 
-    const cleanRows = rawRows.map(row => {
+    const cleanRows = allRows.map(row => {
       const cols = (row.c || []).map(c => (typeof c === 'object' ? c.t : c));
 
-      const groupingVal = getColVal(cols, 'Grouping');
-      const machineName = groupingVal !== "0.00" ? groupingVal : (row.t || cols[1] || cols[0] || 'Unknown');
+      // Extract machine name from 'Grouping' or row title
+      const groupingVal = getColVal(cols, 'Grouping', '');
+      const machineName = groupingVal !== "" && groupingVal !== "0.00" 
+        ? groupingVal 
+        : (row.t || cols[1] || cols[0] || 'Unknown');
+      
       const rawName = String(machineName).trim();
       const normKey = rawName.toLowerCase().replace(/[^a-z0-9]/g, '');
 
@@ -215,7 +235,7 @@ app.get('/api/reports/summary', async (req, res) => {
         "Refulling": getColVal(cols, 'Refulling', '0.00 l'),
         "Parkings": getColVal(cols, 'Parkings', '0:00:00')
       };
-    });
+    }).filter(r => r["Grouping"] !== 'Total' && r["Grouping"] !== 'Unknown'); // Exclude total summary row
 
     await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
 
