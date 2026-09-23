@@ -23,7 +23,7 @@ let sessionId = null;
 let hardwareMapCache = null;
 let lastCacheTime = 0;
 
-// Session Management with auto-relogin
+// Session Management with automatic re-login recovery
 async function getSession() {
   if (sessionId) return sessionId;
 
@@ -43,7 +43,7 @@ async function getSession() {
   return sessionId;
 }
 
-// Hardware & Unit ID Mapping (Resolves physical IMEI uid -> permanent Unit ID id)
+// Hardware & Unit ID Mapping (Priority: Hardware IMEI -> Wialon Unit ID)
 async function getUnitHardwareMap(eid) {
   const now = Date.now();
   if (hardwareMapCache && (now - lastCacheTime < 15 * 60 * 1000)) {
@@ -81,7 +81,7 @@ async function getUnitHardwareMap(eid) {
   return map;
 }
 
-// Default IST dynamic interval (00:00:00 IST to current timestamp)
+// Default IST dynamic interval (00:00:00 IST to current second)
 function getTodayISTInterval() {
   const now = new Date();
   const istOffsetMs = 5.5 * 60 * 60 * 1000;
@@ -108,6 +108,7 @@ app.get('/api/reports/summary', async (req, res) => {
   const templateId = parseInt(req.query.templateId) || DEFAULT_TEMPLATE_ID;
   const objectId   = parseInt(req.query.objectId)   || DEFAULT_OBJECT_ID;
 
+  // Use passed interval or default to dynamic Today IST
   const defaultInterval = getTodayISTInterval();
   const from = parseInt(req.query.from) || defaultInterval.from;
   const to   = parseInt(req.query.to)   || defaultInterval.to;
@@ -116,7 +117,7 @@ app.get('/api/reports/summary', async (req, res) => {
     let eid = await getSession();
     const hardwareMap = await getUnitHardwareMap(eid);
 
-    // Exact payload structure matching your Wialon execution config
+    // Exact execution payload matching template 1 parameters
     const execParams = {
       reportResourceId: resourceId,
       reportTemplateId: templateId,
@@ -136,7 +137,7 @@ app.get('/api/reports/summary', async (req, res) => {
       params: { svc: 'report/exec_report', params: JSON.stringify(execParams), sid: eid }
     });
 
-    // Session expired recovery
+    // Auto-recovery if session expired
     if (execRes.data.error === 1) {
       sessionId = null;
       eid = await getSession();
@@ -146,27 +147,37 @@ app.get('/api/reports/summary', async (req, res) => {
     }
 
     if (execRes.data.error) {
-      return res.status(400).json({ error: `Wialon report error code: ${execRes.data.error}` });
+      return res.status(400).json({ error: `Wialon report execution error code: ${execRes.data.error}` });
     }
 
     const reportTables = execRes.data.reportResult?.tables || [];
-    if (reportTables.length === 0) {
+    if (reportTables.length === 0 || reportTables[0].rows === 0) {
       await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
       return res.json([]);
     }
 
-    // Read Table 0 (Summary table)
-    const rowParams = {
+    // Step 1: Query level 1 (sub-rows inside unit grouping)
+    let rowParams = {
       tableIndex: 0,
-      config: { type: 'range', data: { from: 0, to: 1000, level: 0 } }
+      config: { type: 'range', data: { from: 0, to: 1000, level: 1 } }
     };
 
-    const rowsRes = await axios.get(WIALON_URL, {
+    let rowsRes = await axios.get(WIALON_URL, {
       params: { svc: 'report/select_result_rows', params: JSON.stringify(rowParams), sid: eid }
     });
 
+    let rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
+
+    // Step 2: Fallback to level 0 if level 1 returned empty
+    if (rawRows.length === 0) {
+      rowParams.config.data.level = 0;
+      rowsRes = await axios.get(WIALON_URL, {
+        params: { svc: 'report/select_result_rows', params: JSON.stringify(rowParams), sid: eid }
+      });
+      rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
+    }
+
     const headers = reportTables[0]?.header || [];
-    const rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
 
     const getColVal = (cols, keyword) => {
       const idx = headers.findIndex(h => (h || '').toLowerCase().trim() === keyword.toLowerCase().trim());
@@ -181,7 +192,7 @@ app.get('/api/reports/summary', async (req, res) => {
       const rawName = String(machineName).trim();
       const normKey = rawName.toLowerCase().replace(/[^a-z0-9]/g, '');
 
-      // Resolve Unique ID: exact name -> stripped name -> row unit id -> number fallback
+      // Resolve Unique ID: exact name -> stripped key -> row unit id -> number fallback
       const uniqueId = hardwareMap[rawName.toLowerCase()] 
                     || hardwareMap[normKey] 
                     || (row.i ? hardwareMap[String(row.i)] : null) 
@@ -200,7 +211,7 @@ app.get('/api/reports/summary', async (req, res) => {
       };
     });
 
-    // Cleanup report result memory in Wialon
+    // Free report memory on Wialon server
     await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
 
     res.json(cleanRows);
