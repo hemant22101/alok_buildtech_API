@@ -19,7 +19,7 @@ const DEFAULT_TEMPLATE_ID = 1;
 const DEFAULT_OBJECT_ID   = 28314498;
 
 let sessionId = null;
-let unitsCatalogCache = null;
+let hardwareMapCache = null;
 let lastCacheTime = 0;
 
 // Session Management with automatic re-login recovery
@@ -42,18 +42,17 @@ async function getSession() {
   return sessionId;
 }
 
-// Unit Catalog: Extracts ID, Fuel Sensor Config, and Last Known Sensor Values
-async function getUnitsCatalog(eid) {
+// Hardware & Unit ID Mapping
+async function getUnitHardwareMap(eid) {
   const now = Date.now();
-  if (unitsCatalogCache && (now - lastCacheTime < 15 * 60 * 1000)) {
-    return unitsCatalogCache;
+  if (hardwareMapCache && (now - lastCacheTime < 15 * 60 * 1000)) {
+    return hardwareMapCache;
   }
 
-  // Flags: 1 (base) + 4096 (sensors) = 4097
   const searchParams = {
     spec: { itemsType: 'avl_unit', propName: 'sys_name', propValueMask: '*', sortType: 'sys_name' },
     force: 1,
-    flags: 4097,
+    flags: 268435457,
     from: 0,
     to: 0
   };
@@ -62,89 +61,26 @@ async function getUnitsCatalog(eid) {
     params: { svc: 'core/search_items', params: JSON.stringify(searchParams), sid: eid }
   });
 
-  const catalog = {
-    byName: {},
-    byNormalized: {},
-    byId: {},
-    allUnits: []
-  };
-
+  const map = {};
   (res.data.items || []).forEach(unit => {
     const identifier = unit.uid || (unit.net ? unit.net.uid : null) || unit.id;
-    
-    // Locate Fuel Level Sensor (ID 4 in your unit configuration)
-    let fuelSensorId = null;
-    if (unit.sens) {
-      for (const sId in unit.sens) {
-        const s = unit.sens[sId];
-        if (s.t === 'fuel level' || s.p === 'fuel_lvl' || (s.n && s.n.toLowerCase().includes('fuel'))) {
-          fuelSensorId = s.id;
-          break;
-        }
-      }
-    }
-
-    const unitInfo = {
-      id: unit.id,
-      name: unit.nm,
-      uniqueId: identifier,
-      fuelSensorId: fuelSensorId
-    };
-
-    catalog.allUnits.push(unitInfo);
 
     if (unit.nm) {
       const cleanName = unit.nm.trim().toLowerCase();
-      catalog.byName[cleanName] = unitInfo;
-      catalog.byNormalized[cleanName.replace(/[^a-z0-9]/g, '')] = unitInfo;
+      map[cleanName] = identifier;
+      map[cleanName.replace(/[^a-z0-9]/g, '')] = identifier;
     }
     if (unit.id) {
-      catalog.byId[String(unit.id)] = unitInfo;
+      map[String(unit.id)] = identifier;
     }
   });
 
-  unitsCatalogCache = catalog;
+  hardwareMapCache = map;
   lastCacheTime = now;
-  return catalog;
+  return map;
 }
 
-// Fetch last known fuel level via calc_last_message or last message sensor value
-async function getLastKnownFuelLevel(unitId, sensorId, eid) {
-  if (!sensorId) return "0.00 l";
-  try {
-    const res = await axios.get(WIALON_URL, {
-      params: {
-        svc: 'unit/calc_last_message',
-        params: JSON.stringify({ unitId: unitId, sensorId: sensorId }),
-        sid: eid
-      }
-    });
-
-    if (res.data && typeof res.data.result === 'number' && res.data.result > 0) {
-      return `${res.data.result.toFixed(2)} l`;
-    }
-
-    // Fallback: Check last message parameters directly
-    const msgRes = await axios.get(WIALON_URL, {
-      params: {
-        svc: 'messages/load_last',
-        params: JSON.stringify({ itemId: unitId, lastTime: Math.floor(Date.now() / 1000), lastCount: 1, flags: 0, flagsMask: 0, loadCount: 1 }),
-        sid: eid
-      }
-    });
-
-    const lastMsg = msgRes.data?.messages?.[0];
-    if (lastMsg && lastMsg.p && lastMsg.p.fuel_lvl !== undefined) {
-      return `${Number(lastMsg.p.fuel_lvl).toFixed(2)} l`;
-    }
-
-    return "0.00 l";
-  } catch {
-    return "0.00 l";
-  }
-}
-
-// Helper: dynamic today interval (00:00:00 IST to current timestamp)
+// Default IST dynamic interval (00:00:00 IST to current timestamp)
 function getTodayISTInterval() {
   const now = new Date();
   const istOffsetMs = 5.5 * 60 * 60 * 1000;
@@ -155,12 +91,11 @@ function getTodayISTInterval() {
   return { from, to };
 }
 
-// Health Check
 app.get('/', (req, res) => {
   res.json({ status: 'online', service: 'Alok Buildtech Telematics & Fuel API' });
 });
 
-// Summary Endpoint with Parking Time and Fuel Fallback
+// Summary Endpoint matching the exact template columns
 app.get('/api/reports/summary', async (req, res) => {
   const key = req.headers['x-api-key'] || req.query.apiKey;
   if (key !== CLIENT_API_KEY) {
@@ -177,7 +112,7 @@ app.get('/api/reports/summary', async (req, res) => {
 
   try {
     let eid = await getSession();
-    const catalog = await getUnitsCatalog(eid);
+    const hardwareMap = await getUnitHardwareMap(eid);
 
     const execParams = {
       reportResourceId: resourceId,
@@ -185,7 +120,11 @@ app.get('/api/reports/summary', async (req, res) => {
       reportTemplate: null,
       reportObjectId: objectId,
       reportObjectSecId: 0,
-      interval: { flags: 16777216, from, to },
+      interval: {
+        flags: 16777216,
+        from: from,
+        to: to
+      },
       remoteExec: 1,
       reportObjectIdList: []
     };
@@ -207,96 +146,55 @@ app.get('/api/reports/summary', async (req, res) => {
     }
 
     const reportTables = execRes.data.reportResult?.tables || [];
-    const headers = reportTables[0]?.header || [];
-    let rawRows = [];
-
-    if (reportTables.length > 0 && reportTables[0].rows > 0) {
-      const rowParams = {
-        tableIndex: 0,
-        config: { type: 'range', data: { from: 0, to: 1000, level: 0 } }
-      };
-
-      const rowsRes = await axios.get(WIALON_URL, {
-        params: { svc: 'report/select_result_rows', params: JSON.stringify(rowParams), sid: eid }
-      });
-
-      rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
+    if (reportTables.length === 0 || reportTables[0].rows === 0) {
+      await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
+      return res.json([]);
     }
 
-    // Helper: Match column header value flexibly across possible aliases
-    const getColVal = (cols, keywords, defaultVal = "0.00") => {
-      const keywordList = Array.isArray(keywords) ? keywords : [keywords];
-      for (const kw of keywordList) {
-        const idx = headers.findIndex(h => (h || '').toLowerCase().trim().includes(kw.toLowerCase().trim()));
-        if (idx !== -1 && cols[idx] !== undefined && cols[idx] !== null && cols[idx] !== "") {
-          return cols[idx];
-        }
-      }
-      return defaultVal;
+    // Read Table 0 Rows
+    const rowParams = {
+      tableIndex: 0,
+      config: { type: 'range', data: { from: 0, to: 1000, level: 0 } }
     };
 
-    const cleanRows = [];
-    const reportedUnitNames = new Set();
+    const rowsRes = await axios.get(WIALON_URL, {
+      params: { svc: 'report/select_result_rows', params: JSON.stringify(rowParams), sid: eid }
+    });
 
-    // 1. Process active units that appeared in report table
-    for (const row of rawRows) {
+    const headers = reportTables[0]?.header || [];
+    const rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
+
+    // Header index matcher
+    const getColVal = (cols, keyword, fallback = "0.00") => {
+      const idx = headers.findIndex(h => (h || '').toLowerCase().trim() === keyword.toLowerCase().trim());
+      return idx !== -1 && cols[idx] !== undefined && cols[idx] !== null && cols[idx] !== "" ? cols[idx] : fallback;
+    };
+
+    const cleanRows = rawRows.map(row => {
       const cols = (row.c || []).map(c => (typeof c === 'object' ? c.t : c));
 
-      const groupingVal = getColVal(cols, ['Grouping', 'Unit', 'Object']);
+      const groupingVal = getColVal(cols, 'Grouping');
       const machineName = groupingVal !== "0.00" ? groupingVal : (row.t || cols[1] || cols[0] || 'Unknown');
       const rawName = String(machineName).trim();
       const normKey = rawName.toLowerCase().replace(/[^a-z0-9]/g, '');
 
-      reportedUnitNames.add(normKey);
+      const uniqueId = hardwareMap[rawName.toLowerCase()] 
+                    || hardwareMap[normKey] 
+                    || (row.i ? hardwareMap[String(row.i)] : null) 
+                    || (row.i ? Number(row.i) : null);
 
-      const unitMatch = catalog.byName[rawName.toLowerCase()] 
-                     || catalog.byNormalized[normKey] 
-                     || (row.i ? catalog.byId[String(row.i)] : null);
-
-      const uniqueId = unitMatch?.uniqueId || (row.i ? Number(row.i) : null);
-
-      // Extract parking or stay duration from report columns
-      let parkingTime = getColVal(cols, ['Parking', 'Parkings', 'Stay time', 'Stops duration'], null);
-      const timeRun = getColVal(cols, ['Time Run', 'Engine hours', 'Move time'], '0:00:00');
-
-      // If parking wasn't explicitly added to template but unit ran 0 time, parking = 24h
-      if (!parkingTime) {
-        parkingTime = timeRun === "0:00:00" ? "24:00:00" : "0:00:00";
-      }
-
-      cleanRows.push({
+      return {
         "Machine GPS Unique ID": uniqueId,
         "Grouping": rawName,
-        "Run KM": getColVal(cols, ['Run KM', 'Mileage'], '0.00 km'),
-        "Time Run": timeRun,
-        "Parking Time": parkingTime,
-        "Fuel Opening": getColVal(cols, ['Fuel Opening', 'Initial fuel'], '0.00 l'),
-        "Fuel Closing": getColVal(cols, ['Fuel Closing', 'Final fuel'], '0.00 l'),
-        "Fuel Consumed": getColVal(cols, ['Fuel consumed', 'Consumed'], '0.00 l'),
-        "Refuelling": getColVal(cols, ['Refulling', 'Filled'], '0.00 l')
-      });
-    }
-
-    // 2. Process stationary/parked units not present in report rows
-    for (const unit of catalog.allUnits) {
-      const normKey = unit.name.toLowerCase().replace(/[^a-z0-9]/g, '');
-
-      if (!reportedUnitNames.has(normKey)) {
-        const lastFuel = await getLastKnownFuelLevel(unit.id, unit.fuelSensorId, eid);
-
-        cleanRows.push({
-          "Machine GPS Unique ID": unit.uniqueId,
-          "Grouping": unit.name,
-          "Run KM": "0.00 km",
-          "Time Run": "0:00:00",
-          "Parking Time": "24:00:00",
-          "Fuel Opening": lastFuel,
-          "Fuel Closing": lastFuel,
-          "Fuel Consumed": "0.00 l",
-          "Refuelling": "0.00 l"
-        });
-      }
-    }
+        "Run KM": getColVal(cols, 'Run KM', '0.00 km'),
+        "Time Run": getColVal(cols, 'Time Run', '0:00:00'),
+        "Fuel Opening": getColVal(cols, 'Fuel Opening', '0.00 l'),
+        "Fuel Closing": getColVal(cols, 'Fuel Closing', '0.00 l'),
+        "Fuel Consumed": getColVal(cols, 'Fuel Consumed', '0.00 l'),
+        "Refulling": getColVal(cols, 'Refulling', '0.00 l'),
+        "Parkings": getColVal(cols, 'Parkings', '0:00:00')
+      };
+    });
 
     await axios.get(WIALON_URL, { params: { svc: 'report/cleanup_result', params: '{}', sid: eid } });
 
