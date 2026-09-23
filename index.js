@@ -95,7 +95,7 @@ app.get('/', (req, res) => {
   res.json({ status: 'online', service: 'Alok Buildtech Telematics & Fuel API' });
 });
 
-// Summary Endpoint matching the exact template columns
+// Summary Endpoint
 app.get('/api/reports/summary', async (req, res) => {
   const key = req.headers['x-api-key'] || req.query.apiKey;
   if (key !== CLIENT_API_KEY) {
@@ -151,20 +151,41 @@ app.get('/api/reports/summary', async (req, res) => {
       return res.json([]);
     }
 
-    // Read Table 0 Rows
-    const rowParams = {
-      tableIndex: 0,
-      config: { type: 'range', data: { from: 0, to: 1000, level: 0 } }
-    };
-
-    const rowsRes = await axios.get(WIALON_URL, {
-      params: { svc: 'report/select_result_rows', params: JSON.stringify(rowParams), sid: eid }
+    // Step 1: Probe level 0 rows
+    let rowsRes = await axios.get(WIALON_URL, {
+      params: {
+        svc: 'report/select_result_rows',
+        params: JSON.stringify({
+          tableIndex: 0,
+          config: { type: 'range', data: { from: 0, to: 1000, level: 0 } }
+        }),
+        sid: eid
+      }
     });
 
-    const headers = reportTables[0]?.header || [];
-    const rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
+    let rawRows = Array.isArray(rowsRes.data) ? rowsRes.data : [];
 
-    // Header index matcher
+    // Step 2: If level 0 rows have no cells, or if there is deeper detalization, fetch level 1
+    const hasDataCells = rawRows.some(r => Array.isArray(r.c) && r.c.length > 0);
+    if (!hasDataCells || rawRows.length === 0) {
+      const subRowsRes = await axios.get(WIALON_URL, {
+        params: {
+          svc: 'report/select_result_rows',
+          params: JSON.stringify({
+            tableIndex: 0,
+            config: { type: 'range', data: { from: 0, to: 1000, level: 1 } }
+          }),
+          sid: eid
+        }
+      });
+      if (Array.isArray(subRowsRes.data) && subRowsRes.data.length > 0) {
+        rawRows = subRowsRes.data;
+      }
+    }
+
+    const headers = reportTables[0]?.header || [];
+
+    // Flexible column matcher
     const getColVal = (cols, keyword, fallback = "0.00") => {
       const idx = headers.findIndex(h => (h || '').toLowerCase().trim() === keyword.toLowerCase().trim());
       return idx !== -1 && cols[idx] !== undefined && cols[idx] !== null && cols[idx] !== "" ? cols[idx] : fallback;
