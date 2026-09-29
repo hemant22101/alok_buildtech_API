@@ -15,10 +15,10 @@ const WIALON_URL = 'https://hst-api.wialon.com/wialon/ajax.html';
 const TOKEN = process.env.WIALON_TOKEN;
 const CLIENT_API_KEY = process.env.CLIENT_API_KEY || 'alok_buidtech_abpl@9000';
 
-// Updated Default IDs
+// Updated target parameters
 const DEFAULT_RESOURCE_ID = 28310909;
 const DEFAULT_TEMPLATE_ID = 12;
-const DEFAULT_OBJECT_ID   = 28378146;
+const DEFAULT_OBJECT_ID   = 28314498;
 
 let sessionId = null;
 let hardwareMapCache = null;
@@ -117,7 +117,7 @@ app.get('/api/reports/summary', async (req, res) => {
     let eid = await getSession();
     const hardwareMap = await getUnitHardwareMap(eid);
 
-    // 1. Execute report
+    // 1. Execute report with updated IDs
     const execParams = {
       reportResourceId: resourceId,
       reportTemplateId: templateId,
@@ -168,7 +168,7 @@ app.get('/api/reports/summary', async (req, res) => {
       return idx !== -1 && cols[idx] !== undefined ? cols[idx] : "0.00";
     };
 
-    // 3. Map exact columns matching the Wialon report view
+    // 3. Map columns matching the Wialon report view
     const cleanRows = rawRows.map(row => {
       const cols = (row.c || []).map(c => (typeof c === 'object' ? c.t : c));
 
